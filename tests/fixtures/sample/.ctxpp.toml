@@ -1,0 +1,50 @@
+version = 1
+profile = "model"
+tokenizer = "external:python3 tests/tokenizer.py"
+source_write = true
+preserve_public_api = true
+preserve_abi = true
+sources = ["include/**/*.hpp", "src/**/*.cpp", "tests/**/*.cpp"]
+exclude = ["build/**", ".git/**", ".ctxpp/**"]
+
+[budgets]
+default_slice_tokens = 500
+fragment_target_tokens = 70
+fragment_soft_max_tokens = 300
+fragment_hard_max_tokens = 500
+fragment_min_tokens = 20
+max_fragments_per_host = 8
+
+[identifiers]
+rename_locals = true
+rename_parameters = false
+rename_private_members = false
+rename_internal_functions = false
+minimum_net_token_saving = 2
+allow_unicode_identifiers = false
+
+[comments]
+contract_language = true
+compress_public_docs = false
+preserve_special_comments = true
+
+[rewrites]
+remove_redundant_else = true
+simplify_exact_bool = true
+scalar_ternary = false
+remove_braces = false
+replace_explicit_type_with_auto = false
+invent_macros = false
+using_namespace = false
+
+[verification]
+build = ["cmake --build build"]
+targeted_tests = ["ctest --test-dir build --output-on-failure"]
+full_tests = []
+abi = []
+performance = []
+
+[protected]
+paths = ["include/**"]
+symbols = []
+name_patterns = ["demo::PackingPlan::freeze"]

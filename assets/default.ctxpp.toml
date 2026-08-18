@@ -1,0 +1,56 @@
+version = 1
+profile = "view"
+tokenizer = "auto"
+notation = "token-min"
+source_write = false
+preserve_public_api = true
+preserve_abi = true
+allow_cuda = true
+sources = ["include/**/*.h", "include/**/*.hh", "include/**/*.hpp", "src/**/*.cc", "src/**/*.cpp", "src/**/*.cxx", "src/**/*.cu", "src/**/*.cuh", "tests/**/*.cpp"]
+exclude = ["build/**", "cmake-build-*/**", "third_party/**", "vendor/**", "generated/**", ".git/**", ".ctxpp/**"]
+
+[tool]
+max_workers = 4
+
+[budgets]
+default_slice_tokens = 2400
+route_tokens = 400
+fragment_target_tokens = 1200
+fragment_soft_max_tokens = 2400
+fragment_hard_max_tokens = 3200
+fragment_min_tokens = 200
+max_fragments_per_host = 8
+
+[identifiers]
+rename_locals = true
+rename_parameters = false
+rename_private_members = false
+rename_internal_functions = false
+minimum_net_token_saving = 4
+allow_unicode_identifiers = false
+
+[comments]
+contract_language = true
+compress_public_docs = false
+preserve_special_comments = true
+
+[rewrites]
+remove_redundant_else = true
+simplify_exact_bool = true
+scalar_ternary = false
+remove_braces = false
+replace_explicit_type_with_auto = false
+invent_macros = false
+using_namespace = false
+
+[verification]
+build = []
+targeted_tests = []
+full_tests = []
+abi = []
+performance = []
+
+[protected]
+paths = []
+symbols = []
+name_patterns = []

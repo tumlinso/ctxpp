@@ -1,0 +1,15 @@
+id,category,prompt,target,intent,should_trigger,allow_source_write,expected_symbol
+locate,locate,Where is PackingPlan::freeze?,demo::PackingPlan::freeze,understand,1,0,demo::PackingPlan::freeze
+invariant,explain,Explain the nonlocal invariant used by freeze,demo::PackingPlan::freeze,understand,1,0,demo::PackingPlan::freeze
+one_fix,edit,Fix the candidate limit handling in freeze,demo::PackingPlan::freeze,edit,1,0,demo::PackingPlan::freeze
+cross_shard,edit,Change scoring across freeze and score,demo::PackingPlan::freeze,edit,1,0,demo::PackingPlan::freeze
+tests,test,Find and update the relevant freeze test,demo::PackingPlan::freeze,test,1,0,demo::PackingPlan::freeze
+diagnostic,debug,Diagnose a compiler error inside freeze,demo::PackingPlan::freeze,debug,1,0,demo::PackingPlan::freeze
+performance,performance,Optimize the hot freeze loop without changing behavior,demo::PackingPlan::freeze,performance,1,0,demo::PackingPlan::freeze
+author,author,Add a context-efficient helper beside PackingPlan,demo::PackingPlan,edit,1,0,demo::PackingPlan
+audit,audit,Audit the monolithic plan.cpp for context structure,demo::PackingPlan::freeze,understand,1,0,demo::PackingPlan::freeze
+compact,compaction,Explicitly plan model-profile source compaction,demo::PackingPlan::freeze,edit,1,1,demo::PackingPlan::freeze
+shard,sharding,Explicitly plan same-TU sharding for plan.cpp,demo::PackingPlan::freeze,edit,1,1,demo::PackingPlan::freeze
+ordinary,negative,Implement an ordinary C++ accessor,demo::PackingPlan::score,edit,0,0,demo::PackingPlan::score
+unconfigured,negative,Fix an ordinary C++ bug in an unconfigured repository,demo::PackingPlan::freeze,edit,0,0,demo::PackingPlan::freeze
+api,api,Review the public PackingPlan compatibility surface,demo::PackingPlan,api,1,0,demo::PackingPlan

@@ -1,0 +1,4 @@
+CTXPP-ROUTE/1
+score.inc:score candidates|symbols:proxy_score,exact_score|uses:PackingPlan,Candidate|tokens:734
+move.inc:mutate plan|symbols:move,swap|mut:PackingPlan.order|tokens:611
+oracle.inc:validate rollback|symbols:check,rollback|uses:score,state|tokens:492

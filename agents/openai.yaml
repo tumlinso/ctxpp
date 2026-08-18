@@ -1,0 +1,4 @@
+interface:
+  display_name: "C++ Context Compiler"
+  short_description: "Budgeted semantic C++ context slices"
+  default_prompt: "Use $cpp-context-compiler to resolve a C++ target and generate the smallest sufficient, source-mapped context bundle."

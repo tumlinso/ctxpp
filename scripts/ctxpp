@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from ctxpp_lib import (  # noqa: E402
+    CtxppError, Tokenizer, apply_plan, audit_repository, explain_generated, find_compdb, find_core, find_root,
+    index_status, lint_repository, load_config, load_index, partition_index, persist_view, render_bundle,
+    resolve_symbols, route_symbols, scan_repository, semantic_local_rename_plan, shard_plan, source_text,
+    stable_json, verify_commands,
+)
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="ctxpp", description="Deterministic C++ context compiler")
+    p.add_argument("--root", type=Path, help="repository root (defaults to nearest .ctxpp.toml)")
+    p.add_argument("--json", action="store_true", help="emit stable JSON")
+    sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("doctor")
+    sub.add_parser("status")
+    scan = sub.add_parser("scan"); scan.add_argument("paths", nargs="*")
+    where = sub.add_parser("where"); where.add_argument("target"); where.add_argument("--limit", type=int, default=8)
+    route = sub.add_parser("route"); route.add_argument("query"); route.add_argument("--limit", type=int, default=8)
+    for name in ("slice", "view"):
+        cmd = sub.add_parser(name); cmd.add_argument("target"); cmd.add_argument("--intent", choices=("understand", "edit", "debug", "test", "api", "performance"), default="understand")
+        cmd.add_argument("--budget", type=int); cmd.add_argument("--depth", type=int, default=1)
+        cmd.add_argument("--layout", choices=("navigable", "flat-functions", "extreme"), default="navigable")
+    explain = sub.add_parser("explain"); explain.add_argument("query")
+    expand = sub.add_parser("expand"); expand.add_argument("target")
+    audit = sub.add_parser("audit"); audit.add_argument("paths", nargs="*")
+    plan = sub.add_parser("plan"); plan.add_argument("paths", nargs="*"); plan.add_argument("--rule", default="semantic-local-rename")
+    shard = sub.add_parser("shard"); shard.add_argument("path")
+    apply = sub.add_parser("apply"); apply.add_argument("plan", type=Path)
+    verify = sub.add_parser("verify"); verify.add_argument("target", nargs="?"); verify.add_argument("--tier", action="append", default=[])
+    lint = sub.add_parser("lint"); lint.add_argument("paths", nargs="*")
+    return p
+
+
+def doctor(root: Path, cfg: dict, configured: bool, skill_root: Path) -> dict:
+    compdb = find_compdb(root, cfg)
+    core = find_core(skill_root)
+    core_info = {"available": False}
+    if core:
+        proc = subprocess.run([str(core), "doctor"], text=True, capture_output=True, check=False)
+        if proc.returncode == 0:
+            try: core_info = json.loads(proc.stdout.splitlines()[0])
+            except (json.JSONDecodeError, IndexError): core_info = {"available": True, "version": "unknown"}
+        else: core_info = {"available": False, "error": proc.stderr.strip()}
+    tokenizer = Tokenizer(root, str(cfg.get("tokenizer", "auto"))).count("ctxpp tokenizer probe")
+    standards = []
+    if compdb:
+        try:
+            raw = json.loads(compdb.read_text(encoding="utf-8"))
+            for entry in raw:
+                command = entry.get("arguments") or str(entry.get("command", "")).split()
+                standards += [x.split("=", 1)[1] for x in command if str(x).startswith("-std=")]
+        except (OSError, json.JSONDecodeError): pass
+    dev = any(Path(p).is_file() for p in ("/usr/lib/llvm-18/lib/cmake/clang/ClangConfig.cmake", "/usr/lib/llvm-20/lib/cmake/clang/ClangConfig.cmake"))
+    current_status = index_status(root, cfg)
+    return {
+        "format": "CTXPP-DOCTOR/1", "root": str(root), "configured": configured,
+        "clang_executable": next((shutil.which(x) for x in ("clang++", "clang++-20", "clang++-18") if shutil.which(x)), None),
+        "llvm_config": shutil.which("llvm-config"), "clang_development": dev, "semantic_core": core_info,
+        "compilation_database": str(compdb) if compdb else None, "standards": sorted(set(standards)) or ["unknown"],
+        "extensions": [".h", ".hh", ".hpp", ".hxx", ".cc", ".cpp", ".cxx", ".cu", ".cuh"],
+        "tokenizer": {"identity": tokenizer.identity, "version": tokenizer.version, "exact": tokenizer.exact},
+        "verification": cfg.get("verification", {}),
+        "source_rewriting_safe": bool(configured and current_status.get("source_write_safe")),
+        "parse_failures": current_status.get("failures", []),
+        "limitations": [x for x, yes in (("configuration-missing", not configured), ("compilation-database-missing", not compdb),
+                                                   ("semantic-core-not-built", not core_info.get("available")),
+                                                   ("libtooling-development-files-missing", not dev),
+                                                   ("exact-tokenizer-missing", not tokenizer.exact)) if yes],
+    }
+
+
+def print_result(value, as_json: bool) -> None:
+    if as_json or not isinstance(value, str):
+        print(stable_json(value))
+    else:
+        print(value, end="" if value.endswith("\n") else "\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    root = find_root(args.root).resolve() if args.root else find_root()
+    cfg, configured = load_config(root)
+    skill_root = SCRIPT_DIR.parent
+    try:
+        if args.command == "doctor":
+            result = doctor(root, cfg, configured, skill_root)
+        elif args.command == "status":
+            result = {"format": "CTXPP-STATUS/1", "root": str(root), "configured": configured, **index_status(root, cfg)}
+        elif args.command == "scan":
+            result = {"format": "CTXPP-SCAN/1", **scan_repository(root, cfg, skill_root, args.paths)}
+        elif args.command in ("where", "route"):
+            matches = resolve_symbols(root, args.target, args.limit) if args.command == "where" else route_symbols(root, args.query, args.limit)
+            result = {"format": f"CTXPP-{args.command.upper()}/1", "incomplete": not bool(partition_index(load_index(root))[0].get("semantic")),
+                      "matches": [{k: s.get(k) for k in ("id", "qualified_name", "kind", "file", "line", "definition", "degraded")} for s in matches]}
+        elif args.command in ("slice", "view"):
+            matches = resolve_symbols(root, args.target, 8)
+            if not matches: raise CtxppError(f"target not found: {args.target}")
+            if len(matches) > 1 and not any(args.target == s.get(k) for s in matches for k in ("id", "qualified_name")):
+                result = {"format": "CTXPP-AMBIGUOUS/1", "candidates": [{"id": s["id"], "name": s.get("qualified_name"), "file": s.get("file"), "line": s.get("line")} for s in matches]}
+            else:
+                target = matches[0]
+                budget = args.budget or int(cfg.get("budgets", {}).get("default_slice_tokens", 2400))
+                tokenizer = Tokenizer(root, str(cfg.get("tokenizer", "auto")))
+                core = find_core(skill_root)
+                text, source_map, report = render_bundle(root, target, args.intent, budget, tokenizer, compact=args.command == "view", core=core, layout=args.layout)
+                if args.command == "view":
+                    view_path, map_path = persist_view(root, text, source_map)
+                    result = {"format": "CTXPP-VIEW/1", "readonly": True, "view": str(view_path), "source_map": str(map_path), "report": report, "content": text}
+                else:
+                    result = text if not args.json else {"format": "CTXPP-SLICE/1", "report": report, "content": text, "source_map": source_map}
+        elif args.command == "explain":
+            result = {"format": "CTXPP-EXPLAIN/1", **explain_generated(root, args.query)}
+        elif args.command == "expand":
+            matches = resolve_symbols(root, args.target, 2)
+            if not matches: raise CtxppError(f"target not found: {args.target}")
+            result = source_text(root, matches[0])
+        elif args.command == "audit":
+            result = audit_repository(root, cfg, args.paths)
+        elif args.command == "lint":
+            result = lint_repository(root, cfg, args.paths)
+        elif args.command == "plan":
+            if args.rule != "semantic-local-rename": raise CtxppError(f"unsupported V1 source rule: {args.rule}")
+            plan = semantic_local_rename_plan(root, cfg, args.paths)
+            result = {k: v for k, v in plan.items() if k not in ("files", "edits", "creates")}
+            result["edits"] = len(plan["edits"])
+        elif args.command == "shard":
+            plan = shard_plan(root, cfg, args.path)
+            result = {k: v for k, v in plan.items() if k not in ("files", "edits", "creates")}
+            result.update({"edits": len(plan["edits"]), "creates": [x["file"] for x in plan["creates"]]})
+        elif args.command == "apply":
+            plan_path = args.plan if args.plan.is_absolute() else root / args.plan
+            result = apply_plan(root, cfg, plan_path.resolve())
+        elif args.command == "verify":
+            verify_cfg = cfg
+            if args.target:
+                target_path = Path(args.target)
+                if not target_path.is_absolute(): target_path = root / target_path
+                if target_path.is_file() and target_path.suffix == ".json":
+                    payload = json.loads(target_path.read_text(encoding="utf-8"))
+                    if payload.get("format") == "CTXPP-PLAN/1":
+                        verify_cfg = {**cfg, "verification": payload.get("verification", {})}
+            tier_map = {"V0": [], "V1": ["build"], "V2": ["build", "targeted_tests"],
+                        "V3": ["build", "targeted_tests", "full_tests"],
+                        "V4": ["build", "targeted_tests", "full_tests", "abi"],
+                        "V5": ["build", "targeted_tests", "full_tests", "abi", "performance"]}
+            selected = []
+            for tier in args.tier:
+                selected.extend(tier_map.get(tier.upper(), [tier]))
+            semantic = scan_repository(root, cfg, skill_root)
+            runs = [{"tier": "V1", "command": "ctxpp scan", "returncode": 0 if semantic["failures"] == 0 and semantic["backend"] != "degraded-text-routing" else 1,
+                     "stdout": stable_json(semantic), "stderr": ""}]
+            runs += verify_commands(root, verify_cfg, selected)
+            no_requested_commands = bool(args.tier) and len(runs) == 1 and all(t.upper() != "V1" for t in args.tier)
+            result = {"format": "CTXPP-VERIFY/1", "target": args.target, "tiers": args.tier,
+                      "ok": all(x["returncode"] == 0 for x in runs) and not no_requested_commands,
+                      "runs": runs, "reason": "no configured commands for requested tier" if no_requested_commands else None}
+        else:  # pragma: no cover
+            raise CtxppError("unhandled command")
+        print_result(result, args.json)
+        if isinstance(result, dict) and result.get("success") is False: return 1
+        if isinstance(result, dict) and result.get("ok") is False and args.command == "verify": return 1
+        return 0
+    except (CtxppError, OSError, json.JSONDecodeError) as exc:
+        print(f"ctxpp: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

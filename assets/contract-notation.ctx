@@ -1,0 +1,5 @@
+CTXPP-CONTRACT/1
+fields:in|out|req|ens|inv|mut|own|thr|sync|err|cost|num|abbr|why
+ascii:flow=->,empty=none,delta=delta,sum=sum,all=all,exists=exists,neq=!=,bound=<=
+unicode:flow=->,empty=empty,delta=Delta,sum=Sigma,all=forall,exists=exists,neq=!=,bound=<=
+preserve:license,doxygen,NOLINT,IWYU,formatter,coverage,generated,build,test,user-text
