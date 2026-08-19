@@ -357,52 +357,209 @@ def compdb_by_file(records: list[dict[str, Any]]) -> dict[Path, list[dict[str, A
     return result
 
 
+@dataclass(frozen=True)
+class _CppToken:
+    text: str
+    start: int
+    end: int
+    kind: str = "token"
+
+
+def _cpp_tokens(data: bytes) -> list[_CppToken]:
+    """Conservative byte lexer for range recovery; it never supplies semantic proof."""
+    result: list[_CppToken] = []
+    i = 0
+    while i < len(data):
+        byte = data[i]
+        if byte in b" \t\r\n\f\v":
+            i += 1; continue
+        if data.startswith(b"//", i):
+            end = data.find(b"\n", i + 2); end = len(data) if end < 0 else end
+            result.append(_CppToken(data[i:end].decode(errors="replace"), i, end, "comment")); i = end; continue
+        if data.startswith(b"/*", i):
+            end = data.find(b"*/", i + 2); end = len(data) if end < 0 else end + 2
+            result.append(_CppToken(data[i:end].decode(errors="replace"), i, end, "comment")); i = end; continue
+        raw_prefix = next((prefix for prefix in (b'u8R"', b'uR"', b'UR"', b'LR"', b'R"') if data.startswith(prefix, i)), None)
+        if raw_prefix:
+            delimiter_start = i + len(raw_prefix)
+            opening = data.find(b"(", delimiter_start, min(len(data), delimiter_start + 17))
+            if opening < 0:
+                result.append(_CppToken(raw_prefix.decode(), i, i + len(raw_prefix), "opaque")); i += len(raw_prefix); continue
+            delimiter = data[delimiter_start:opening]
+            closing = data.find(b")" + delimiter + b'"', opening + 1)
+            end = len(data) if closing < 0 else closing + len(delimiter) + 2
+            result.append(_CppToken("<raw-string>", i, end, "literal")); i = end; continue
+        if byte in (ord('"'), ord("'")):
+            quote = byte; start = i; i += 1
+            while i < len(data):
+                if data[i] == ord("\\"): i += 2
+                elif data[i] == quote: i += 1; break
+                else: i += 1
+            result.append(_CppToken("<literal>", start, min(i, len(data)), "literal")); continue
+        line_start = data.rfind(b"\n", 0, i) + 1
+        if byte == ord("#") and not data[line_start:i].strip():
+            start = i
+            while True:
+                end = data.find(b"\n", i)
+                if end < 0: end = len(data); break
+                if end > start and data[end - 1] == ord("\\"): i = end + 1; continue
+                break
+            result.append(_CppToken(data[start:end].decode(errors="replace"), start, end, "preprocessor")); i = end; continue
+        if byte == ord("_") or chr(byte).isalpha():
+            start = i; i += 1
+            while i < len(data) and (data[i] == ord("_") or chr(data[i]).isalnum()): i += 1
+            result.append(_CppToken(data[start:i].decode(errors="replace"), start, i, "identifier")); continue
+        result.append(_CppToken(chr(byte), i, i + 1)); i += 1
+    return result
+
+
+def _attached_comment_start(data: bytes, declaration_start: int) -> int:
+    start = declaration_start
+    cursor = data.rfind(b"\n", 0, declaration_start) + 1
+    while cursor > 0:
+        line_end = cursor - 1
+        line_start = data.rfind(b"\n", 0, line_end) + 1
+        line = data[line_start:line_end].strip()
+        if not line:
+            break
+        if line.startswith((b"//", b"///", b"//!")):
+            start = line_start; cursor = line_start; continue
+        if line.endswith(b"*/"):
+            block_start = data.rfind(b"/*", 0, line_end)
+            if block_start >= 0:
+                start = block_start; cursor = block_start; continue
+        break
+    return start
+
+
+def _lexical_declarations(data: bytes) -> list[dict[str, Any]]:
+    tokens = _cpp_tokens(data)
+    declarations: list[dict[str, Any]] = []
+    keywords = {"class", "struct", "enum", "union"}
+    for index, token in enumerate(tokens):
+        if token.kind != "identifier" or token.text not in keywords:
+            continue
+        name_index = index + 1
+        if token.text == "enum" and name_index < len(tokens) and tokens[name_index].text in ("class", "struct"):
+            name_index += 1
+        while name_index < len(tokens) and tokens[name_index].kind == "comment": name_index += 1
+        if name_index >= len(tokens) or tokens[name_index].kind != "identifier":
+            continue
+        name_token = tokens[name_index]
+        cursor = name_index + 1
+        opening = -1
+        terminator = -1
+        while cursor < len(tokens):
+            current = tokens[cursor]
+            if current.text == "{": opening = cursor; break
+            if current.text == ";": terminator = cursor; break
+            if current.text == "}" or current.kind == "preprocessor": break
+            cursor += 1
+        declaration_start = token.start
+        # Preserve immediately adjacent template/export/attribute prefixes without crossing a prior entity.
+        prior = index - 1
+        while prior >= 0 and tokens[prior].kind == "comment": prior -= 1
+        boundary = prior
+        while boundary >= 0 and tokens[boundary].text not in (";", "{", "}"):
+            boundary -= 1
+        prefix = tokens[boundary + 1:index]
+        if any(item.text in ("template", "export", "[") for item in prefix):
+            declaration_start = prefix[0].start
+        declaration_start = _attached_comment_start(data, declaration_start)
+        definition = opening >= 0
+        body_start = body_end = None
+        range_valid = True
+        if definition:
+            depth = 0
+            closing = -1
+            for position in range(opening, len(tokens)):
+                current = tokens[position]
+                if current.kind == "preprocessor": range_valid = False
+                if current.text == "{": depth += 1
+                elif current.text == "}":
+                    depth -= 1
+                    if depth == 0:
+                        closing = position; break
+            if closing < 0:
+                range_valid = False; declaration_end = name_token.end
+            else:
+                body_start, body_end = tokens[opening].start, tokens[closing].end
+                after = closing + 1
+                while after < len(tokens) and tokens[after].kind == "comment": after += 1
+                if after < len(tokens) and tokens[after].text == ";":
+                    declaration_end = tokens[after].end
+                else:
+                    declaration_end = tokens[closing].end; range_valid = False
+        elif terminator >= 0:
+            declaration_end = tokens[terminator].end
+        else:
+            declaration_end = name_token.end; range_valid = False
+        declarations.append({"name": name_token.text, "keyword": token.text,
+                             "name_start": name_token.start, "name_end": name_token.end,
+                             "declaration_start": declaration_start, "declaration_end": declaration_end,
+                             "body_start": body_start, "body_end": body_end, "definition": definition,
+                             "range_valid": range_valid, "target_complete": range_valid})
+    return declarations
+
+
 def lexical_symbols(root: Path, paths: Iterable[Path], semantic: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Route-only declarations for files without current semantic records."""
     semantic_files = {str(symbol.get("file", "")) for symbol in semantic}
-    semantic_names = {(str(symbol.get("file", "")), str(symbol.get("name", ""))) for symbol in semantic}
+    semantic_definitions = {(str(symbol.get("file", "")), str(symbol.get("name", "")))
+                            for symbol in semantic if symbol.get("definition")}
     result: list[dict[str, Any]] = []
     declaration_words = {"class": "LexicalClassDecl", "struct": "LexicalStructDecl",
-                         "enum": "LexicalEnumDecl", "union": "LexicalUnionDecl", "namespace": "LexicalNamespaceDecl"}
+                         "enum": "LexicalEnumDecl", "union": "LexicalUnionDecl"}
     for path in paths:
         rel = path.relative_to(root).as_posix()
         data = path.read_bytes()
         identifiers = sorted(_lexical_identifiers(data))
-        text = data.decode("utf-8", errors="replace")
-        tokens: list[tuple[str, int, int]] = []
-        i = 0
-        while i < len(text):
-            if text.startswith("//", i):
-                i = text.find("\n", i + 2); i = len(text) if i < 0 else i + 1; continue
-            if text.startswith("/*", i):
-                end = text.find("*/", i + 2); i = len(text) if end < 0 else end + 2; continue
-            if text[i] in {'"', "'"}:
-                quote = text[i]; i += 1
-                while i < len(text) and text[i] != quote:
-                    i += 2 if text[i] == "\\" else 1
-                i += i < len(text); continue
-            if text[i] == "_" or text[i].isalpha():
-                start = i; i += 1
-                while i < len(text) and (text[i] == "_" or text[i].isalnum()): i += 1
-                tokens.append((text[start:i], start, i)); continue
-            i += 1
-        for index, (word, _, _) in enumerate(tokens[:-1]):
-            if word not in declaration_words:
+        for declaration in _lexical_declarations(data):
+            name = declaration["name"]
+            if (rel, name) in semantic_definitions:
                 continue
-            name, start, end = tokens[index + 1]
-            if name in {"class", "struct", "enum", "union", "namespace", "final"}:
-                continue
-            if (rel, name) in semantic_names:
-                continue
-            line = data[:len(text[:start].encode("utf-8"))].count(b"\n") + 1
-            result.append({"record": "symbol", "id": f"lex:{rel}:{start}", "name": name,
-                           "qualified_name": name, "kind": declaration_words[word], "file": rel,
-                           "start": start, "end": end, "line": line, "end_line": line, "column": 1,
-                           "end_column": max(1, end - start + 1), "definition": True, "degraded": True,
-                           "semantic_origin": "lexical_only", "readiness": "route-ready", "tokens": 1,
-                           "signature": f"{word} {name}", "contract": "", "lexical_terms": " ".join(identifiers),
+            start, end = declaration["declaration_start"], declaration["declaration_end"]
+            line = data[:start].count(b"\n") + 1
+            end_line = data[:end].count(b"\n") + 1
+            definition = bool(declaration["definition"])
+            kind = declaration_words[declaration["keyword"]]
+            result.append({"record": "symbol", "id": f"lex:{rel}:{declaration['name_start']}", "name": name,
+                           "qualified_name": name, "kind": kind, "file": rel,
+                           "start": start, "end": end, "name_start": declaration["name_start"],
+                           "name_end": declaration["name_end"], "body_start": declaration["body_start"],
+                           "body_end": declaration["body_end"], "line": line, "end_line": end_line, "column": 1,
+                           "end_column": 1, "definition": definition, "degraded": True,
+                           "semantic_origin": "lexical_only", "readiness": "route-ready",
+                           "representation_kind": "lexical-complete-definition" if definition else "lexical-declaration",
+                           "range_valid": declaration["range_valid"], "target_complete": declaration["target_complete"],
+                           "body_present": definition and declaration["range_valid"], "range_version": 2,
+                           "source_hash": sha256_bytes(data), "tokens": max(1, (end - start) // 4),
+                           "signature": data[start:(declaration["body_start"] or end)].decode(errors="replace").strip(),
+                           "contract": "", "lexical_terms": " ".join(identifiers),
                            "occurrences": [{"file": rel, "start": start, "end": end, "line": line,
-                                            "end_line": line, "definition": True}]})
+                                            "end_line": end_line, "definition": definition}]})
+        # Preserve the pre-existing namespace routing anchors.  They are locations,
+        # not complete slice representations.
+        cpp_tokens = _cpp_tokens(data)
+        for index, token in enumerate(cpp_tokens[:-1]):
+            name_token = cpp_tokens[index + 1]
+            if token.text != "namespace" or name_token.kind != "identifier":
+                continue
+            name = name_token.text
+            if (rel, name) in semantic_definitions:
+                continue
+            line = data[:name_token.start].count(b"\n") + 1
+            result.append({"record": "symbol", "id": f"lex:{rel}:{name_token.start}", "name": name,
+                           "qualified_name": name, "kind": "LexicalNamespaceDecl", "file": rel,
+                           "start": name_token.start, "end": name_token.end, "name_start": name_token.start,
+                           "name_end": name_token.end, "line": line, "end_line": line, "column": 1,
+                           "end_column": len(name) + 1, "definition": True, "degraded": True,
+                           "semantic_origin": "lexical_only", "readiness": "route-ready",
+                           "representation_kind": "name-only", "range_valid": False,
+                           "target_complete": False, "body_present": False, "range_version": 2,
+                           "source_hash": sha256_bytes(data), "tokens": 1,
+                           "signature": f"namespace {name}", "contract": "",
+                           "lexical_terms": " ".join(identifiers), "occurrences": []})
         if rel not in semantic_files and not any(symbol.get("file") == rel for symbol in result):
             name = path.stem
             result.append({"record": "symbol", "id": f"lex-file:{rel}", "name": name,
@@ -417,7 +574,8 @@ def lexical_symbols(root: Path, paths: Iterable[Path], semantic: list[dict[str, 
 def lexical_overlay(root: Path) -> list[dict[str, Any]]:
     try:
         payload = json.loads((index_dir(root) / "cache/lexical-overlay.json").read_text(encoding="utf-8"))
-        return list(payload.get("symbols", [])) if payload.get("format") == "CTXPP-LEXICAL-OVERLAY/1" else []
+        return list(payload.get("symbols", [])) if (payload.get("format") == "CTXPP-LEXICAL-OVERLAY/1"
+                                                       and payload.get("range_version") == 2) else []
     except (OSError, json.JSONDecodeError, TypeError):
         return []
 
@@ -428,7 +586,7 @@ def refresh_lexical_overlay(root: Path, paths: Iterable[Path]) -> None:
     symbols = [symbol for symbol in lexical_overlay(root) if symbol.get("file") not in rels]
     symbols.extend(lexical_symbols(root, selected, []))
     symbols.sort(key=lambda symbol: (symbol.get("qualified_name", ""), symbol.get("file", ""), symbol.get("start", 0)))
-    payload = {"format": "CTXPP-LEXICAL-OVERLAY/1", "symbols": symbols}
+    payload = {"format": "CTXPP-LEXICAL-OVERLAY/1", "range_version": 2, "symbols": symbols}
     atomic_write(index_dir(root) / "cache/lexical-overlay.json", (stable_json(payload) + "\n").encode())
 
 
@@ -1280,6 +1438,50 @@ def ensure_query_fresh(root: Path, cfg: dict[str, Any], skill_root: Path, query:
     return True
 
 
+def _location_target(root: Path, target: str) -> tuple[str, int] | None:
+    path_text, separator, line_text = target.rpartition(":")
+    if not separator or not line_text.isdigit():
+        return None
+    path = Path(path_text)
+    if path.is_absolute():
+        try:
+            path = path.resolve().relative_to(root.resolve())
+        except (OSError, ValueError):
+            return None
+    return path.as_posix().removeprefix("./"), int(line_text)
+
+
+def _lexical_location_matches(overlay: list[dict[str, Any]], file: str, line: int, limit: int) -> list[dict[str, Any]]:
+    matches = [symbol for symbol in overlay
+               if symbol.get("file") == file
+               and int(symbol.get("line", 0)) <= line <= int(symbol.get("end_line", symbol.get("line", 0)))]
+    matches.sort(key=lambda symbol: (
+        not (symbol.get("definition") and symbol.get("target_complete")),
+        not symbol.get("target_complete"),
+        int(symbol.get("end", 0)) - int(symbol.get("start", 0)),
+        str(symbol.get("qualified_name", "")),
+        str(symbol.get("id", "")),
+    ))
+    # A location denotes the tightest complete lexical entity.  Returning broader
+    # containing declarations as peers would turn a precise location into ambiguity.
+    return matches[:1] if matches else []
+
+
+def _location_matches(root: Path, target: str, semantic: list[dict[str, Any]],
+                      overlay: list[dict[str, Any]], limit: int) -> list[dict[str, Any]] | None:
+    location = _location_target(root, target)
+    if location is None:
+        return None
+    file, line = location
+    lexical = _lexical_location_matches(overlay, file, line, limit)
+    if semantic:
+        # Preserve the established semantic ordering and identity for every valid
+        # semantic containment.  Lexical candidates are a completeness fallback,
+        # not competitors with a precise semantic result.
+        return semantic[:limit]
+    return lexical
+
+
 def resolve_symbols(root: Path, target: str, limit: int = 8) -> list[dict[str, Any]]:
     overlay = lexical_overlay(root)
     overlay_exact = [symbol for symbol in overlay if target in (symbol.get("id"), symbol.get("name"), symbol.get("qualified_name"))]
@@ -1292,10 +1494,10 @@ def resolve_symbols(root: Path, target: str, limit: int = 8) -> list[dict[str, A
                 exact = [s for s in store.exact(target, limit) if s.get("id") == target]
                 if exact:
                     return exact
-            if ":" in target:
-                maybe_file, _, maybe_line = target.rpartition(":")
-                if maybe_line.isdigit():
-                    return store.location(maybe_file, int(maybe_line), limit)
+            location = _location_target(root, target)
+            if location is not None:
+                semantic = store.location(location[0], location[1], limit)
+                return _location_matches(root, target, semantic, overlay, limit) or []
             exact = store.exact(target, limit)
             if exact:
                 return sorted(exact, key=lambda s: (s.get("qualified_name") != target, not s.get("definition"), s.get("file", "")))[:limit]
@@ -1305,18 +1507,21 @@ def resolve_symbols(root: Path, target: str, limit: int = 8) -> list[dict[str, A
             store.close()
     records = load_index(root)
     _, files, symbols, _ = partition_index(records)
+    location = _location_target(root, target)
+    if location is not None:
+        line = location[1]
+        semantic = [symbol for symbol in symbols
+                    if symbol.get("file") == location[0]
+                    and int(symbol.get("line", 0)) <= line <= int(symbol.get("end_line", symbol.get("line", 0)))]
+        semantic.sort(key=lambda symbol: (int(symbol.get("end", 0)) - int(symbol.get("start", 0)),
+                                          str(symbol.get("qualified_name", ""))))
+        return _location_matches(root, target, semantic[:limit], overlay, limit) or []
     if not symbols:
         return rank_candidates(target, [*overlay, *degraded_locations(root, target, files, limit)], limit)
     if target.startswith("usr:") or target.startswith("c:"):
         exact = [s for s in symbols if s["id"] == target]
         if exact:
             return exact[:limit]
-    if ":" in target:
-        maybe_file, _, maybe_line = target.rpartition(":")
-        if maybe_line.isdigit():
-            line = int(maybe_line)
-            matches = [s for s in symbols if s.get("file") == maybe_file and s.get("line", 0) <= line <= s.get("end_line", s.get("line", 0))]
-            return sorted(matches, key=lambda s: (s.get("end", 0) - s.get("start", 0), s.get("qualified_name", "")))[:limit]
     exact = [s for s in symbols if target in (s.get("qualified_name"), s.get("name"), s.get("id"))]
     if exact:
         return sorted(exact, key=lambda s: (s.get("qualified_name") != target, not s.get("definition"), s.get("file", "")))[:limit]
@@ -1386,7 +1591,85 @@ def source_text(root: Path, symbol: dict[str, Any]) -> str:
     return data[start:end].decode("utf-8", errors="replace")
 
 
-def choose_fragments(root: Path, target: dict[str, Any], intent: str, budget: int, tokenizer: Tokenizer) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, bool]:
+_COMPLETE_TARGET_INTENTS = {"api", "edit", "understand", "debug", "performance", "test"}
+
+
+def recover_target_representation(root: Path, target: dict[str, Any], intent: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Recover a truthful target range without changing semantic-index behavior."""
+    recovered = dict(target)
+    degraded = bool(recovered.get("degraded"))
+    definition = bool(recovered.get("definition"))
+    range_valid = False
+    try:
+        source = root / str(recovered["file"])
+        data = source.read_bytes()
+        start, end = int(recovered.get("start", -1)), int(recovered.get("end", -1))
+        range_valid = 0 <= start < end <= len(data)
+        if recovered.get("source_hash") and recovered.get("source_hash") != sha256_bytes(data):
+            range_valid = False
+    except (KeyError, OSError, TypeError, ValueError):
+        data = b""
+
+    if not degraded:
+        kind = "semantic-definition" if definition else "semantic-declaration"
+        record_kind = str(recovered.get("kind", ""))
+        record_like = "Record" in record_kind or record_kind in ("EnumDecl", "CXXRecordDecl")
+        definition_required = record_like and intent in _COMPLETE_TARGET_INTENTS
+        complete = range_valid and (definition or not definition_required)
+        coverage = {"representation_kind": kind, "degraded": False, "range_valid": range_valid,
+                    "is_definition": definition, "body_present": bool(recovered.get("body_present", definition)),
+                    "target_complete": complete, "contracts_complete": True,
+                    "required_dependencies_complete": True, "elisions_declared": True}
+        recovered.update(coverage)
+        return recovered, coverage
+
+    # Lexical records from older overlays and text matches may contain only the name.
+    # Re-lex this one canonical file and prefer its complete definition for content intents.
+    candidates: list[dict[str, Any]] = []
+    if data:
+        try:
+            candidates = [symbol for symbol in lexical_symbols(root, [root / str(recovered["file"])], [])
+                          if symbol.get("name") == recovered.get("name")]
+        except (OSError, ValueError):
+            candidates = []
+    if candidates:
+        want_definition = intent in _COMPLETE_TARGET_INTENTS
+        candidates.sort(key=lambda symbol: (
+            not (want_definition and symbol.get("definition") and symbol.get("target_complete")),
+            symbol.get("id") != target.get("id"),
+            not symbol.get("target_complete"),
+            -(int(symbol.get("end", 0)) - int(symbol.get("start", 0))),
+            int(symbol.get("start", 0)),
+        ))
+        recovered = dict(candidates[0])
+        data = (root / str(recovered["file"])).read_bytes()
+        range_valid = bool(recovered.get("range_valid")) and recovered.get("source_hash") == sha256_bytes(data)
+        definition = bool(recovered.get("definition"))
+
+    complete = range_valid and bool(recovered.get("target_complete"))
+    if intent in _COMPLETE_TARGET_INTENTS:
+        complete = complete and definition and bool(recovered.get("body_present"))
+    if complete:
+        kind = "canonical-definition" if definition else "canonical-declaration"
+    elif range_valid and int(recovered.get("end", 0)) > int(recovered.get("start", 0)):
+        kind = "lexical-declaration"
+    elif recovered.get("name"):
+        kind = "name-only"
+    else:
+        kind = "unavailable"
+    coverage = {"representation_kind": kind, "degraded": True, "range_valid": range_valid,
+                "is_definition": definition, "body_present": bool(recovered.get("body_present")),
+                "target_complete": complete, "contracts_complete": complete,
+                # A lexical declaration has no trustworthy typed dependency graph.  The
+                # canonical target is useful, but API sufficiency remains conservative.
+                "required_dependencies_complete": intent not in _COMPLETE_TARGET_INTENTS,
+                "elisions_declared": complete}
+    recovered.update(coverage)
+    return recovered, coverage
+
+
+def choose_fragments(root: Path, target: dict[str, Any], intent: str, budget: int, tokenizer: Tokenizer) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, bool, dict[str, Any]]:
+    target, coverage = recover_target_representation(root, target, intent)
     records = load_index(root)
     _, _, symbols, edges = partition_index(records)
     by_id = {s["id"]: s for s in symbols}
@@ -1431,15 +1714,88 @@ def choose_fragments(root: Path, target: dict[str, Any], intent: str, budget: in
         else:
             omitted.append(item)
     mandatory_total = target_tokens + sum(x["tokens"] for x in omitted if x["mandatory"]) + sum(x["tokens"] for x in selected[1:] if x["mandatory"])
-    sufficient = not any(x["mandatory"] for x in omitted)
-    return selected, omitted, mandatory_total, sufficient
+    mandatory_omitted = any(x["mandatory"] for x in omitted)
+    reason = ""
+    if not coverage["range_valid"] or not coverage["target_complete"]:
+        reason = "incomplete-target-representation"
+    elif mandatory_total > budget:
+        reason = "mandatory-context-over-budget"
+    elif mandatory_omitted:
+        reason = "mandatory-context-over-budget"
+    elif not coverage["required_dependencies_complete"]:
+        reason = "required-dependency-unresolved"
+    elif not coverage["contracts_complete"]:
+        reason = "contract-coverage-partial"
+    sufficient = not reason
+    coverage["sufficiency_reason"] = reason
+    return selected, omitted, mandatory_total, sufficient, coverage
+
+
+def lexical_api_skeleton(text: str, symbol: dict[str, Any], tokenizer: Tokenizer) -> str | None:
+    """Elide only large inline method bodies; retain the complete record surface."""
+    canonical_tokens = tokenizer.count(text).count
+    if canonical_tokens <= 1200 or not symbol.get("range_valid") or not symbol.get("body_present"):
+        return None
+    data = text.encode()
+    tokens = _cpp_tokens(data)
+    outer = next((index for index, token in enumerate(tokens) if token.text == "{"), -1)
+    if outer < 0:
+        return None
+    depth = 0
+    boundary = outer + 1
+    replacements: list[tuple[int, int]] = []
+    index = outer
+    while index < len(tokens):
+        token = tokens[index]
+        if token.kind == "preprocessor":
+            return None
+        if token.text == "{":
+            if depth == 1:
+                prefix = [item.text for item in tokens[boundary:index] if item.kind != "comment"]
+                # Restrict the V1 skeleton to unmistakable member-function bodies.
+                if ")" in prefix and not any(word in prefix for word in ("class", "struct", "union", "enum", "=")):
+                    nested = 1
+                    closing = index + 1
+                    while closing < len(tokens) and nested:
+                        if tokens[closing].kind == "preprocessor":
+                            return None
+                        if tokens[closing].text == "{": nested += 1
+                        elif tokens[closing].text == "}": nested -= 1
+                        closing += 1
+                    if nested:
+                        return None
+                    replacements.append((token.end, tokens[closing - 1].start))
+                    boundary = closing
+                    index = closing
+                    continue
+            depth += 1
+        elif token.text == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        if depth == 1 and token.text in (";", "}"):
+            boundary = index + 1
+        index += 1
+    if not replacements:
+        return None
+    candidate = bytearray(data)
+    for start, end in reversed(replacements):
+        candidate[start:end] = b"/*...*/"
+    rendered = candidate.decode(errors="replace")
+    candidate_tokens = tokenizer.count(rendered).count
+    if candidate_tokens * 100 > canonical_tokens * 60:
+        return None
+    return rendered
 
 
 @timed("slice_and_view_assembly")
 def render_bundle(root: Path, target: dict[str, Any], intent: str, budget: int, tokenizer: Tokenizer, *, compact: bool = False,
                   core: Path | None = None, layout: str = "navigable") -> tuple[str, dict[str, Any], dict[str, Any]]:
-    selected, omitted, mandatory_total, sufficient = choose_fragments(root, target, intent, budget, tokenizer)
+    selected, omitted, mandatory_total, sufficient, coverage = choose_fragments(root, target, intent, budget, tokenizer)
+    target = selected[0]["symbol"]
     header = f"CTXPP/1 intent={intent} budget={budget} sufficient={1 if sufficient else 0} readonly=1 layout={layout}"
+    if coverage.get("degraded") and not sufficient and coverage.get("sufficiency_reason"):
+        header += f" reason={coverage['sufficiency_reason']}"
     rendered = []
     records = load_index(root)
     _, _, all_symbols, all_edges = partition_index(records)
@@ -1474,7 +1830,13 @@ def render_bundle(root: Path, target: dict[str, Any], intent: str, budget: int, 
         symbol = item["symbol"]
         text = item["text"]
         mode = "verbatim"
-        if compact and not (intent == "edit" and item["role"] == "target") and core:
+        degraded_target = item["role"] == "target" and bool(symbol.get("degraded"))
+        if compact and degraded_target and intent == "api":
+            skeleton = lexical_api_skeleton(text, symbol, tokenizer)
+            if skeleton is not None:
+                text = skeleton
+                mode = "lexical-structural"
+        if compact and not degraded_target and not (intent == "edit" and item["role"] == "target") and core:
             compacted = compacted_by_id.get(symbol["id"])
             if compacted:
                 text, token_maps = compacted
@@ -1484,7 +1846,7 @@ def render_bundle(root: Path, target: dict[str, Any], intent: str, budget: int, 
         else:
             token_maps = []
         rename_maps: list[dict[str, Any]] = []
-        if compact and not (intent == "edit" and item["role"] == "target"):
+        if compact and not degraded_target and not (intent == "edit" and item["role"] == "target"):
             text, fragment_glossary, rename_maps = abbreviate_generated_fragment(
                 root, symbol, text, token_maps, all_symbols, all_edges, tokenizer
             )
@@ -1525,6 +1887,10 @@ def render_bundle(root: Path, target: dict[str, Any], intent: str, budget: int, 
         "selected_source_tokens_before": selected_source_before, "selected_source_tokens_after": selected_source_after,
         "selected_source_token_delta": selected_source_before - selected_source_after,
     }
+    if coverage.get("degraded"):
+        report.update({"representation_kind": coverage["representation_kind"],
+                       "target_complete": coverage["target_complete"],
+                       "sufficiency_reason": coverage.get("sufficiency_reason", "")})
     source_map = {"format": "CTXPP-MAP/1", "readonly": True, "target": target["id"], "mappings": mappings, "report": report}
     return text, source_map, report
 
