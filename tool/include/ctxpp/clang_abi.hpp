@@ -20,6 +20,7 @@ struct CXUnsavedFile { const char* Filename; const char* Contents; unsigned long
 
 enum CXChildVisitResult : unsigned { Break = 0, Continue = 1, Recurse = 2 };
 using CXCursorVisitor = CXChildVisitResult (*)(CXCursor, CXCursor, CXClientData);
+using CXInclusionVisitor = void (*)(CXFile, CXSourceLocation*, unsigned, CXClientData);
 
 struct Api {
   void* handle{};
@@ -61,6 +62,7 @@ struct Api {
   CXSourceLocation (*getLocationForOffset)(CXTranslationUnit, CXFile, unsigned){};
   CXSourceRange (*getRange)(CXSourceLocation, CXSourceLocation){};
   CXFile (*getIncludedFile)(CXCursor){};
+  void (*getInclusions)(CXTranslationUnit, CXInclusionVisitor, CXClientData){};
   void (*tokenize)(CXTranslationUnit, CXSourceRange, CXToken**, unsigned*){};
   void (*annotateTokens)(CXTranslationUnit, CXToken*, unsigned, CXCursor*){};
   void (*disposeTokens)(CXTranslationUnit, CXToken*, unsigned){};

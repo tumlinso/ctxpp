@@ -5,38 +5,35 @@ description: Minimize Codex context for C++ by indexing symbols, generating budg
 
 # C++ Context Compiler
 
-Treat canonical C++ as the only editable, compiler-facing source. Use generated `.ctxpp/` bundles as read-only retrieval artifacts; never edit or copy changes back from them without locating the mapped canonical range.
+Canonical C++ is authoritative. `.ctxpp/` bundles are generated, read-only retrieval artifacts; map edits back to canonical ranges.
 
-## Select one mode
+## Route one mode
 
-- **Retrieve**: run `ctxpp status`, `where` or `route`, then `slice --intent ...`. Read [references/retrieval.md](references/retrieval.md).
-- **Author**: retrieve first, edit canonical source, test, then rescan and lint. Read [references/authoring.md](references/authoring.md); read [references/topology.md](references/topology.md) only for file boundaries or sharding.
-- **Audit**: run `ctxpp audit`; do not mutate source. Read [references/objective.md](references/objective.md).
-- **Generate compact view**: run `ctxpp view`; keep the edit target verbatim for edit work. Read [references/compact-views.md](references/compact-views.md).
-- **Plan optimization**: require an explicit request for source compaction or sharding. Read [references/topology.md](references/topology.md), [references/source-transforms.md](references/source-transforms.md), [references/cpp-semantic-hazards.md](references/cpp-semantic-hazards.md), and [references/verification.md](references/verification.md). Produce a dry-run plan only.
-- **Apply optimization**: require explicit mutation intent and an existing plan. Revalidate hashes, apply transactionally, verify, and retain the reverse plan. Never commit unless asked.
-- **Explain/expand**: use `ctxpp explain` or `expand`; do not mutate source.
+- Retrieve: `status`; `where`/`route`; `slice --intent ...`. Read [retrieval](references/retrieval.md).
+- Author: retrieve, edit canonical source, test, rescan/lint. Read [authoring](references/authoring.md); add [topology](references/topology.md) only for boundaries/shards.
+- Audit: `audit`, no mutation. Read [objective](references/objective.md).
+- Compact view: `view`; edit targets stay verbatim. Read [compact views](references/compact-views.md).
+- Plan source optimization: explicit compaction/sharding request only; dry-run only. Read [topology](references/topology.md), [transforms](references/source-transforms.md), [hazards](references/cpp-semantic-hazards.md), and [verification](references/verification.md).
+- Apply: explicit mutation intent plus an existing plan; revalidate, transact, verify, retain reverse plan. Never commit unless asked.
+- Explain/expand: `explain`/`expand`, no mutation.
 
-Read [references/comment-contracts.md](references/comment-contracts.md) only when creating or rewriting comments. Read [references/evaluation.md](references/evaluation.md) only when evaluating this skill. Read [references/configuration.md](references/configuration.md) for configuration or command details.
+Read [comment contracts](references/comment-contracts.md) only for comment changes, [evaluation](references/evaluation.md) only for skill evaluation, and [configuration](references/configuration.md) only for setup/CLI details.
 
-## Required opening
+## Open
 
-1. Locate the repository root and `.ctxpp.toml`.
-2. Run `scripts/ctxpp doctor` and `scripts/ctxpp status`.
-3. If the index is stale, run `scripts/ctxpp scan`.
-4. Resolve a narrow target, request an intent-appropriate slice, and open canonical source only for the exact edit range.
+1. On explicit use, run `scripts/ctxpp --root ROOT init`. The agent owns initialization: config, core build, compilation-database discovery/generation, and safe verification-command inference. Preserve existing config. Ask only for a real package/authority blocker.
+2. Run `doctor` and `status`, then narrow with `where`/`route` and an intent slice. Retrieval refreshes relevant stale TUs lazily; do not preemptively full-scan. Before mutation, require a fresh full semantic scan.
+3. Open canonical source only for the edit range. Test changes; refresh index/routes afterward.
 
-For an ordinary C++ task in an opted-in repository, use this skill for retrieval and authoring guidance only. Never compact unrelated source. In an unconfigured repository, do not activate implicitly for routine implementation, review, explanation, bug fixing, or refactoring.
+Initialization is idempotent: never install packages or blindly configure an unknown project. In opted-in repositories, ordinary C++ work uses retrieval/authoring only. Never compact unrelated source; do not activate implicitly for routine C++ work in unconfigured repositories.
 
-## Hard safety behavior
+## Gates
 
-- Preserve behavior, active language modes, APIs, ABI, performance-sensitive structure, diagnostics, and user changes as hard gates.
-- Exclude generated, vendored, dependency, and build trees unless explicitly included.
-- Require Clang-derived identities and ranges for semantic dependencies, renaming, and source plans. Regex may only assist discovery or formatting diagnostics.
-- Disable source plans when compilation commands, semantic tooling, configuration agreement, or exact baseline hashes are missing.
-- If tooling fails, state the limitation and inspect normal readable C++ directly. Do not hand-minify.
-- Measure tokens with the configured adapter; label lexical/byte estimates. Reject negligible transformations.
-- Keep meaningful top-level names and local semantic anchors. Abbreviations must be stable, scoped, collision-free, mapped, and profitable after glossary cost.
-- Refuse edits to paths under `.ctxpp/`.
+- Preserve behavior, language modes, APIs/ABI, performance structure, diagnostics, and user work.
+- Exclude generated/vendor/dependency/build trees. Refuse `.ctxpp/` edits.
+- Semantic dependencies, renames, and plans require Clang identities/ranges; never semantic-regex rewrite.
+- Disable plans without compilation commands, tooling, configuration agreement, exact baseline hashes, or required verification.
+- Tool failure falls back to readable canonical inspection, never hand-minification.
+- Measure configured tokens, label estimates, reject negligible changes; abbreviations stay stable, scoped, mapped, collision-free, and net-profitable.
 
-Run `python -m unittest discover -s tests -v` from this skill to validate the toolkit. Use the skill-creator validator after changing metadata.
+Validate with `python -m unittest discover -s tests -v` and the skill-creator validator after metadata changes.

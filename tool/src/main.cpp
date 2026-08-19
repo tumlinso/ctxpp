@@ -17,9 +17,11 @@
 namespace fs = std::filesystem;
 using ctxpp::clangabi::Api;
 using ctxpp::clangabi::CXChildVisitResult;
+using ctxpp::clangabi::CXClientData;
 using ctxpp::clangabi::CXCursor;
 using ctxpp::clangabi::CXFile;
 using ctxpp::clangabi::CXIndex;
+using ctxpp::clangabi::CXSourceLocation;
 using ctxpp::clangabi::CXSourceRange;
 using ctxpp::clangabi::CXToken;
 using ctxpp::clangabi::CXTranslationUnit;
@@ -109,6 +111,24 @@ struct ScanContext {
   std::vector<std::string> parents;
   std::map<std::string, std::vector<std::string>> declarations_by_name;
 };
+
+void inclusion(CXFile included, CXSourceLocation* stack, unsigned length, CXClientData data) {
+  if (!included || !stack || !length) return;
+  auto& c = *static_cast<ScanContext*>(data);
+  CXFile including{}; unsigned line = 0, column = 0, offset = 0;
+  c.api->getSpellingLocation(stack[0], &including, &line, &column, &offset);
+  if (!including) return;
+  const std::string canonical_from = normalize(take(*c.api, c.api->getFileName(including)));
+  const std::string canonical_to = normalize(take(*c.api, c.api->getFileName(included)));
+  auto in_root = [&c](const std::string& path) { return path == c.root || path.rfind(c.root + "/", 0) == 0; };
+  if (!in_root(canonical_from) || !in_root(canonical_to)) return;
+  const std::string from = relative_to(canonical_from, c.root);
+  const std::string to = relative_to(canonical_to, c.root);
+  std::ostringstream record;
+  record << "{\"record\":\"include\",\"from\":" << json(from) << ",\"to\":" << json(to)
+         << ",\"line\":" << line << "}";
+  c.records.push_back({"I\t" + from + "\t" + to + "\t" + std::to_string(line), record.str()});
+}
 
 std::string cursor_usr(ScanContext& c, CXCursor cursor) { return take(*c.api, c.api->getCursorUSR(cursor)); }
 
@@ -341,6 +361,7 @@ int scan(Api& a, const ParsedArgs& p) {
   catch (...) { a.disposeIndex(index); throw; }
   ScanContext ctx{&a, tu, root, file, source, {}, {}, {}};
   a.visitChildren(a.getTranslationUnitCursor(tu), visit, &ctx);
+  a.getInclusions(tu, inclusion, &ctx);
   CXFile main_cx_file = a.getFile(tu, file.c_str());
   if (main_cx_file && !source.empty()) {
     CXSourceRange all = a.getRange(a.getLocationForOffset(tu, main_cx_file, 0),

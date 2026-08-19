@@ -73,6 +73,7 @@ Api load_api(const char* explicit_path) {
   CTXPP_LOAD(getLocationForOffset, "clang_getLocationForOffset");
   CTXPP_LOAD(getRange, "clang_getRange");
   CTXPP_LOAD(getIncludedFile, "clang_getIncludedFile");
+  CTXPP_LOAD(getInclusions, "clang_getInclusions");
   CTXPP_LOAD(tokenize, "clang_tokenize");
   CTXPP_LOAD(annotateTokens, "clang_annotateTokens");
   CTXPP_LOAD(disposeTokens, "clang_disposeTokens");

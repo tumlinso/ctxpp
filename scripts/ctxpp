@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
-import json
-import os
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+from ctxpp_fast import try_fast  # noqa: E402
+
+_fast_result = try_fast(sys.argv[1:])
+if _fast_result is not None:
+    raise SystemExit(_fast_result)
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+
 from ctxpp_lib import (  # noqa: E402
-    CtxppError, Tokenizer, apply_plan, audit_repository, explain_generated, find_compdb, find_core, find_root,
-    index_status, lint_repository, load_config, load_index, partition_index, persist_view, render_bundle,
+    CtxppError, Tokenizer, apply_plan, atomic_write, audit_repository, ensure_query_fresh, explain_generated, find_compdb, find_core, find_root,
+    index_meta, index_status, lint_repository, load_cached_view, load_config, load_index, partition_index, persist_view, render_bundle,
     resolve_symbols, route_symbols, scan_repository, semantic_local_rename_plan, shard_plan, source_text,
-    stable_json, verify_commands,
+    save_cached_view, stable_json, verify_commands, view_cache_lock,
 )
 
 
@@ -25,6 +32,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--root", type=Path, help="repository root (defaults to nearest .ctxpp.toml)")
     p.add_argument("--json", action="store_true", help="emit stable JSON")
     sub = p.add_subparsers(dest="command", required=True)
+    init = sub.add_parser("init"); init.add_argument("--no-build-core", action="store_true"); init.add_argument("--no-scan", action="store_true")
     sub.add_parser("doctor")
     sub.add_parser("status")
     scan = sub.add_parser("scan"); scan.add_argument("paths", nargs="*")
@@ -43,6 +51,63 @@ def parser() -> argparse.ArgumentParser:
     verify = sub.add_parser("verify"); verify.add_argument("target", nargs="?"); verify.add_argument("--tier", action="append", default=[])
     lint = sub.add_parser("lint"); lint.add_argument("paths", nargs="*")
     return p
+
+
+def initialize(root: Path, skill_root: Path, *, build_core: bool, scan: bool) -> dict:
+    if not root.is_dir():
+        raise CtxppError(f"repository root is not a directory: {root}")
+    if ".ctxpp" in root.parts:
+        raise CtxppError("refusing to initialize a generated .ctxpp directory")
+
+    config_path = root / ".ctxpp.toml"
+    config_created = False
+    if not config_path.exists():
+        template = skill_root / "assets/default.ctxpp.toml"
+        atomic_write(config_path, template.read_bytes())
+        config_created = True
+    elif not config_path.is_file():
+        raise CtxppError(f"configuration path is not a regular file: {config_path}")
+
+    build = {"attempted": False, "returncode": None, "log": None}
+    core = find_core(skill_root)
+    if not core and build_core:
+        build_script = skill_root / "scripts/build_tool.sh"
+        proc = subprocess.run([str(build_script)], cwd=skill_root, text=True, capture_output=True, check=False)
+        log_path = root / ".ctxpp/init-core-build.log"
+        atomic_write(log_path, (proc.stdout + proc.stderr).encode())
+        build = {"attempted": True, "returncode": proc.returncode, "log": str(log_path)}
+        core = find_core(skill_root)
+
+    cfg, configured = load_config(root)
+    compdb = find_compdb(root, cfg)
+    scan_result = None
+    if scan:
+        scan_result = scan_repository(root, cfg, skill_root)
+    current_status = index_status(root, cfg)
+
+    agent_actions = []
+    external_blockers = []
+    if not core:
+        if build_core and build["returncode"] not in (None, 0):
+            external_blockers.append("semantic core build failed; inspect init-core-build.log and install only the reported system dependency")
+        else:
+            agent_actions.append("build the semantic core with scripts/build_tool.sh")
+    if not compdb:
+        agent_actions.append("inspect the repository build system and generate or locate compile_commands.json; do not ask the user to copy configuration manually")
+    if not cfg.get("verification", {}).get("build"):
+        agent_actions.append("before any source mutation, infer and record repository build and targeted-test commands in .ctxpp.toml")
+
+    semantic = bool(scan_result and scan_result.get("backend") != "degraded-text-routing" and scan_result.get("failures") == 0)
+    return {
+        "format": "CTXPP-INIT/1", "root": str(root), "ok": not external_blockers,
+        "configuration": {"path": str(config_path), "created": config_created, "preserved": not config_created},
+        "semantic_core": {"available": bool(core), "path": str(core) if core else None, "build": build},
+        "compilation_database": str(compdb) if compdb else None,
+        "scan": scan_result,
+        "ready": {"routing": bool(scan_result), "semantic_routing": semantic,
+                  "source_rewriting": bool(current_status.get("source_write_safe"))},
+        "agent_actions": agent_actions, "external_blockers": external_blockers,
+    }
 
 
 def doctor(root: Path, cfg: dict, configured: bool, skill_root: Path) -> dict:
@@ -92,21 +157,25 @@ def print_result(value, as_json: bool) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
-    root = find_root(args.root).resolve() if args.root else find_root()
+    root = args.root.resolve() if args.command == "init" and args.root else (find_root(args.root).resolve() if args.root else find_root())
     cfg, configured = load_config(root)
     skill_root = SCRIPT_DIR.parent
     try:
-        if args.command == "doctor":
+        if args.command == "init":
+            result = initialize(root, skill_root, build_core=not args.no_build_core, scan=not args.no_scan)
+        elif args.command == "doctor":
             result = doctor(root, cfg, configured, skill_root)
         elif args.command == "status":
             result = {"format": "CTXPP-STATUS/1", "root": str(root), "configured": configured, **index_status(root, cfg)}
         elif args.command == "scan":
             result = {"format": "CTXPP-SCAN/1", **scan_repository(root, cfg, skill_root, args.paths)}
         elif args.command in ("where", "route"):
+            ensure_query_fresh(root, cfg, skill_root, args.target if args.command == "where" else args.query)
             matches = resolve_symbols(root, args.target, args.limit) if args.command == "where" else route_symbols(root, args.query, args.limit)
-            result = {"format": f"CTXPP-{args.command.upper()}/1", "incomplete": not bool(partition_index(load_index(root))[0].get("semantic")),
+            result = {"format": f"CTXPP-{args.command.upper()}/1", "incomplete": not bool(index_meta(root).get("semantic")),
                       "matches": [{k: s.get(k) for k in ("id", "qualified_name", "kind", "file", "line", "definition", "degraded")} for s in matches]}
         elif args.command in ("slice", "view"):
+            ensure_query_fresh(root, cfg, skill_root, args.target)
             matches = resolve_symbols(root, args.target, 8)
             if not matches: raise CtxppError(f"target not found: {args.target}")
             if len(matches) > 1 and not any(args.target == s.get(k) for s in matches for k in ("id", "qualified_name")):
@@ -114,9 +183,21 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 target = matches[0]
                 budget = args.budget or int(cfg.get("budgets", {}).get("default_slice_tokens", 2400))
-                tokenizer = Tokenizer(root, str(cfg.get("tokenizer", "auto")))
+                tokenizer = Tokenizer(root, str(cfg.get("tokenizer", "auto")), defer_writes=True)
                 core = find_core(skill_root)
-                text, source_map, report = render_bundle(root, target, args.intent, budget, tokenizer, compact=args.command == "view", core=core, layout=args.layout)
+                tokenizer_cache_identity = tokenizer.cache_identity()
+                cached = load_cached_view(root, target, args.intent, budget, args.layout, tokenizer_cache_identity, core) if args.command == "view" else None
+                if args.command == "view" and not cached:
+                    with view_cache_lock(root, target, args.intent, budget, args.layout, tokenizer_cache_identity, core):
+                        cached = load_cached_view(root, target, args.intent, budget, args.layout, tokenizer_cache_identity, core)
+                        if not cached:
+                            text, source_map, report = render_bundle(root, target, args.intent, budget, tokenizer, compact=True, core=core, layout=args.layout)
+                            save_cached_view(root, target, args.intent, budget, args.layout, tokenizer_cache_identity, core, text, source_map, report)
+                if cached:
+                    text, source_map, report = cached
+                elif args.command != "view":
+                    text, source_map, report = render_bundle(root, target, args.intent, budget, tokenizer, compact=False, core=core, layout=args.layout)
+                tokenizer.flush()
                 if args.command == "view":
                     view_path, map_path = persist_view(root, text, source_map)
                     result = {"format": "CTXPP-VIEW/1", "readonly": True, "view": str(view_path), "source_map": str(map_path), "report": report, "content": text}
@@ -125,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "explain":
             result = {"format": "CTXPP-EXPLAIN/1", **explain_generated(root, args.query)}
         elif args.command == "expand":
+            ensure_query_fresh(root, cfg, skill_root, args.target)
             matches = resolve_symbols(root, args.target, 2)
             if not matches: raise CtxppError(f"target not found: {args.target}")
             result = source_text(root, matches[0])
@@ -172,6 +254,7 @@ def main(argv: list[str] | None = None) -> int:
             raise CtxppError("unhandled command")
         print_result(result, args.json)
         if isinstance(result, dict) and result.get("success") is False: return 1
+        if isinstance(result, dict) and result.get("ok") is False and args.command == "init": return 1
         if isinstance(result, dict) and result.get("ok") is False and args.command == "verify": return 1
         return 0
     except (CtxppError, OSError, json.JSONDecodeError) as exc:

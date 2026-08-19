@@ -15,6 +15,8 @@ class SkillMetadataTests(unittest.TestCase):
         self.assertIn("explicitly asks", frontmatter)
         self.assertIn("Never rewrite ordinary C++ implicitly", frontmatter)
         self.assertIn("do not activate implicitly", text)
+        self.assertIn("agent owns initialization", text)
+        self.assertIn("--root ROOT init", text)
 
     def test_references_are_conditionally_routed(self) -> None:
         text = (SKILL / "SKILL.md").read_text(encoding="utf-8")

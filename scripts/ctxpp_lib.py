@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import contextlib
+import fcntl
 import fnmatch
 import hashlib
 import json
@@ -16,6 +18,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from ctxpp_runtime import (ResourceScheduler, build_query_store, count as work_count, open_query_store,
+                           run_process_measured, span, timed)
+from ctxpp_rank import rank as rank_candidates, terms as ranked_terms
+from ctxpp_recipe import (infer as infer_recipe, observed_records, persist_successful, preflight as recipe_preflight,
+                          run_captured, successful_records, translate as translate_recipe)
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover
@@ -23,7 +31,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 
 VERSION = "0.1.0"
-SOURCE_EXTENSIONS = (".h", ".hh", ".hpp", ".hxx", ".cc", ".cpp", ".cxx", ".cu", ".cuh")
+SOURCE_EXTENSIONS = (".h", ".hh", ".hpp", ".hxx", ".inc", ".ipp", ".cc", ".cpp", ".cxx", ".cu", ".cuh")
 DEFAULT_EXCLUDES = ("build/**", "cmake-build-*/**", "third_party/**", "vendor/**", "generated/**", ".git/**", ".ctxpp/**")
 CONTRACT_FIELDS = ("in", "out", "req", "ens", "inv", "mut", "own", "thr", "sync", "err", "cost", "num", "abbr", "why")
 
@@ -40,11 +48,37 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+@timed("file_hashing")
 def sha256_file(path: Path) -> str:
+    work_count("files_hashed")
     return sha256_bytes(path.read_bytes())
 
 
+def git_dirty_paths(root: Path) -> set[str] | None:
+    proc = subprocess.run(["git", "-c", "status.relativePaths=true", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                          cwd=root, text=False, capture_output=True, check=False)
+    if proc.returncode != 0:
+        return None
+    parts = proc.stdout.split(b"\0")
+    dirty: set[str] = set()
+    index = 0
+    while index < len(parts):
+        entry = parts[index]
+        if not entry:
+            index += 1
+            continue
+        status = entry[:2]
+        dirty.add(entry[3:].decode("utf-8", errors="surrogateescape"))
+        if b"R" in status or b"C" in status:
+            index += 1
+            if index < len(parts) and parts[index]:
+                dirty.add(parts[index].decode("utf-8", errors="surrogateescape"))
+        index += 1
+    return dirty
+
+
 def atomic_write(path: Path, data: bytes) -> None:
+    work_count("cache_writes" if ".ctxpp" in path.parts else "atomic_writes")
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
@@ -59,6 +93,32 @@ def atomic_write(path: Path, data: bytes) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+@contextlib.contextmanager
+def publication_lock(root: Path):
+    path = root / ".ctxpp/cache/publish.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def view_cache_lock(root: Path, target: dict[str, Any], intent: str, budget: int, layout: str,
+                    tokenizer_config: str, core: Path | None):
+    request = _view_request_path(root, target, intent, budget, layout, tokenizer_config, core)
+    lock_path = request.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def find_root(start: Path | None = None) -> Path:
@@ -125,6 +185,7 @@ def _merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+@timed("configuration_parsing")
 def load_config(root: Path) -> tuple[dict[str, Any], bool]:
     path = root / ".ctxpp.toml"
     if not path.is_file():
@@ -142,7 +203,8 @@ def is_excluded(rel: str, cfg: dict[str, Any]) -> bool:
     return any(fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(rel + "/", pattern) for pattern in cfg.get("exclude", DEFAULT_EXCLUDES))
 
 
-def source_paths(root: Path, cfg: dict[str, Any], scoped: Iterable[str] = ()) -> list[Path]:
+def source_paths(root: Path, cfg: dict[str, Any], scoped: Iterable[str] = (),
+                 compilation_records: Iterable[dict[str, Any]] = ()) -> list[Path]:
     candidates: set[Path] = set()
     scopes = [Path(x) for x in scoped]
     if scopes:
@@ -155,6 +217,20 @@ def source_paths(root: Path, cfg: dict[str, Any], scoped: Iterable[str] = ()) ->
     else:
         for pattern in cfg.get("sources", []):
             candidates.update(p.resolve() for p in root.glob(pattern) if p.is_file())
+        for record in compilation_records:
+            directory = Path(record.get("directory", root))
+            path = Path(record.get("file", ""))
+            path = path if path.is_absolute() else directory / path
+            if path.is_file():
+                candidates.add(path.resolve())
+        git = subprocess.run(["git", "ls-files", "--cached", "--others", "--modified", "--exclude-standard", "-z"],
+                             cwd=root, capture_output=True, check=False)
+        if git.returncode == 0:
+            for raw in git.stdout.split(b"\0"):
+                if raw:
+                    path = root / raw.decode("utf-8", errors="surrogateescape")
+                    if path.is_file() and path.suffix in SOURCE_EXTENSIONS:
+                        candidates.add(path.resolve())
         if not candidates:
             candidates.update(p.resolve() for p in root.rglob("*") if p.is_file() and p.suffix in SOURCE_EXTENSIONS)
     result = []
@@ -168,6 +244,7 @@ def source_paths(root: Path, cfg: dict[str, Any], scoped: Iterable[str] = ()) ->
     return sorted(result, key=lambda p: p.relative_to(root).as_posix())
 
 
+@timed("compdb_discovery")
 def find_compdb(root: Path, cfg: dict[str, Any]) -> Path | None:
     configured = cfg.get("compilation_database") or cfg.get("tool", {}).get("compilation_database")
     candidates = []
@@ -182,20 +259,41 @@ def find_compdb(root: Path, cfg: dict[str, Any]) -> Path | None:
     return None
 
 
-def read_compdb(path: Path | None) -> list[dict[str, Any]]:
+@timed("compdb_parsing")
+def read_compdb(path: Path | None, cache_root: Path | None = None) -> list[dict[str, Any]]:
     if not path:
         return []
     try:
-        records = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        raw = path.read_bytes()
+    except OSError as exc:
         raise CtxppError(f"invalid compilation database {path}: {exc}") from exc
-    return records if isinstance(records, list) else []
+    digest = sha256_bytes(raw)
+    cache_path = index_dir(cache_root) / "cache/compdb.json" if cache_root else None
+    if cache_path:
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if cached.get("format") == "CTXPP-COMPDB-CACHE/1" and cached.get("hash") == digest:
+                work_count("compdb_cache_hits")
+                return list(cached.get("records", []))
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+    try:
+        records = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise CtxppError(f"invalid compilation database {path}: {exc}") from exc
+    records = records if isinstance(records, list) else []
+    if cache_path:
+        atomic_write(cache_path, (stable_json({"format": "CTXPP-COMPDB-CACHE/1", "hash": digest, "records": records}) + "\n").encode())
+    return records
 
 
 def command_argv(record: dict[str, Any]) -> list[str]:
     if isinstance(record.get("arguments"), list):
         return [str(x) for x in record["arguments"]]
     return shlex.split(str(record.get("command", "")))
+
+
+_COMPILER_INCLUDE_CACHE: dict[str, str | None] = {}
 
 
 def normalized_clang_args(record: dict[str, Any], source: Path) -> list[str]:
@@ -226,11 +324,21 @@ def normalized_clang_args(record: dict[str, Any], source: Path) -> list[str]:
             pass
         result.append(arg)
     if compiler and Path(compiler).name in ("g++", "c++", "gcc"):
-        probe = subprocess.run([compiler, "-print-file-name=include"], text=True, capture_output=True, check=False)
-        include = probe.stdout.strip()
-        if probe.returncode == 0 and include and Path(include).is_dir():
+        if compiler not in _COMPILER_INCLUDE_CACHE:
+            probe = subprocess.run([compiler, "-print-file-name=include"], text=True, capture_output=True, check=False)
+            include = probe.stdout.strip()
+            _COMPILER_INCLUDE_CACHE[compiler] = include if probe.returncode == 0 and include and Path(include).is_dir() else None
+        include = _COMPILER_INCLUDE_CACHE[compiler]
+        if include:
             result += ["-isystem", include]
     return result
+
+
+@dataclass
+class ParseExecution:
+    job: dict[str, Any]
+    completed: subprocess.CompletedProcess[str]
+    peak_memory_mb: int
 
 
 def compdb_by_file(records: list[dict[str, Any]]) -> dict[Path, list[dict[str, Any]]]:
@@ -249,6 +357,124 @@ def compdb_by_file(records: list[dict[str, Any]]) -> dict[Path, list[dict[str, A
     return result
 
 
+def lexical_symbols(root: Path, paths: Iterable[Path], semantic: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Route-only declarations for files without current semantic records."""
+    semantic_files = {str(symbol.get("file", "")) for symbol in semantic}
+    semantic_names = {(str(symbol.get("file", "")), str(symbol.get("name", ""))) for symbol in semantic}
+    result: list[dict[str, Any]] = []
+    declaration_words = {"class": "LexicalClassDecl", "struct": "LexicalStructDecl",
+                         "enum": "LexicalEnumDecl", "union": "LexicalUnionDecl", "namespace": "LexicalNamespaceDecl"}
+    for path in paths:
+        rel = path.relative_to(root).as_posix()
+        data = path.read_bytes()
+        identifiers = sorted(_lexical_identifiers(data))
+        text = data.decode("utf-8", errors="replace")
+        tokens: list[tuple[str, int, int]] = []
+        i = 0
+        while i < len(text):
+            if text.startswith("//", i):
+                i = text.find("\n", i + 2); i = len(text) if i < 0 else i + 1; continue
+            if text.startswith("/*", i):
+                end = text.find("*/", i + 2); i = len(text) if end < 0 else end + 2; continue
+            if text[i] in {'"', "'"}:
+                quote = text[i]; i += 1
+                while i < len(text) and text[i] != quote:
+                    i += 2 if text[i] == "\\" else 1
+                i += i < len(text); continue
+            if text[i] == "_" or text[i].isalpha():
+                start = i; i += 1
+                while i < len(text) and (text[i] == "_" or text[i].isalnum()): i += 1
+                tokens.append((text[start:i], start, i)); continue
+            i += 1
+        for index, (word, _, _) in enumerate(tokens[:-1]):
+            if word not in declaration_words:
+                continue
+            name, start, end = tokens[index + 1]
+            if name in {"class", "struct", "enum", "union", "namespace", "final"}:
+                continue
+            if (rel, name) in semantic_names:
+                continue
+            line = data[:len(text[:start].encode("utf-8"))].count(b"\n") + 1
+            result.append({"record": "symbol", "id": f"lex:{rel}:{start}", "name": name,
+                           "qualified_name": name, "kind": declaration_words[word], "file": rel,
+                           "start": start, "end": end, "line": line, "end_line": line, "column": 1,
+                           "end_column": max(1, end - start + 1), "definition": True, "degraded": True,
+                           "semantic_origin": "lexical_only", "readiness": "route-ready", "tokens": 1,
+                           "signature": f"{word} {name}", "contract": "", "lexical_terms": " ".join(identifiers),
+                           "occurrences": [{"file": rel, "start": start, "end": end, "line": line,
+                                            "end_line": line, "definition": True}]})
+        if rel not in semantic_files and not any(symbol.get("file") == rel for symbol in result):
+            name = path.stem
+            result.append({"record": "symbol", "id": f"lex-file:{rel}", "name": name,
+                           "qualified_name": name, "kind": "LexicalFile", "file": rel, "start": 0,
+                           "end": len(data), "line": 1, "end_line": line_count(data), "definition": False,
+                           "degraded": True, "semantic_origin": "lexical_only", "readiness": "route-ready",
+                           "tokens": max(1, len(data) // 4), "signature": "", "contract": "",
+                           "lexical_terms": " ".join(identifiers), "occurrences": []})
+    return sorted(result, key=lambda symbol: (symbol["qualified_name"], symbol["file"], symbol["start"]))
+
+
+def lexical_overlay(root: Path) -> list[dict[str, Any]]:
+    try:
+        payload = json.loads((index_dir(root) / "cache/lexical-overlay.json").read_text(encoding="utf-8"))
+        return list(payload.get("symbols", [])) if payload.get("format") == "CTXPP-LEXICAL-OVERLAY/1" else []
+    except (OSError, json.JSONDecodeError, TypeError):
+        return []
+
+
+def refresh_lexical_overlay(root: Path, paths: Iterable[Path]) -> None:
+    selected = list(paths)
+    rels = {path.relative_to(root).as_posix() for path in selected}
+    symbols = [symbol for symbol in lexical_overlay(root) if symbol.get("file") not in rels]
+    symbols.extend(lexical_symbols(root, selected, []))
+    symbols.sort(key=lambda symbol: (symbol.get("qualified_name", ""), symbol.get("file", ""), symbol.get("start", 0)))
+    payload = {"format": "CTXPP-LEXICAL-OVERLAY/1", "symbols": symbols}
+    atomic_write(index_dir(root) / "cache/lexical-overlay.json", (stable_json(payload) + "\n").encode())
+
+
+def summarize_diagnostics(root: Path, failures: list[dict[str, Any]], operation: str) -> list[dict[str, Any]]:
+    if not failures:
+        return []
+    log_dir = index_dir(root) / "logs"
+    digest = sha256_bytes(("\n".join(stable_json(item) for item in failures)).encode())[:16]
+    log_path = log_dir / f"{operation}-{digest}.log"
+    atomic_write(log_path, ("\n".join(stable_json(item) for item in failures) + "\n").encode())
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for failure in failures:
+        message = str(failure.get("error", "")).strip()
+        first = next((line.strip() for line in message.splitlines() if line.strip()), "unknown diagnostic")
+        first = first[:512]
+        category = str(failure.get("category") or _diagnostic_category(first))
+        key = (category, first)
+        group = groups.setdefault(key, {"file": failure.get("file"), "configuration": failure.get("configuration"),
+                                        "error": first, "category": category, "count": 0, "affected_files": set()})
+        group["count"] += 1
+        if failure.get("file"):
+            group["affected_files"].add(str(failure["file"]))
+    summary = []
+    for group in sorted(groups.values(), key=lambda value: (value["category"], value["error"]))[:12]:
+        group["affected_file_count"] = len(group.pop("affected_files"))
+        group["details_log"] = log_path.relative_to(root).as_posix()
+        summary.append(group)
+    for old in sorted(log_dir.glob("*.log"), key=lambda path: path.stat().st_mtime_ns)[:-16]:
+        try: old.unlink()
+        except OSError: pass
+    return summary
+
+
+def _diagnostic_category(message: str) -> str:
+    lower = message.lower()
+    if "unknown argument" in lower or "unsupported" in lower or "unrecognized" in lower:
+        return "command_translation"
+    if "cuda" in lower and ("installation" in lower or "toolkit" in lower or "version" in lower):
+        return "toolchain_compatibility"
+    if "no such file" in lower or "file not found" in lower:
+        return "missing_dependency"
+    if "internal" in lower:
+        return "index_internal"
+    return "source_parse"
+
+
 def find_core(skill_root: Path) -> Path | None:
     override = os.environ.get("CTXPP_CORE")
     candidates = [Path(override)] if override else []
@@ -260,7 +486,9 @@ def find_core(skill_root: Path) -> Path | None:
 
 
 def run_core(core: Path, arguments: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run([str(core), *arguments], cwd=cwd, text=True, capture_output=True, check=False)
+    work_count("core_calls")
+    with span(f"core_{arguments[0] if arguments else 'unknown'}"):
+        return subprocess.run([str(core), *arguments], cwd=cwd, text=True, capture_output=True, check=False)
 
 
 @dataclass(frozen=True)
@@ -272,9 +500,12 @@ class TokenCount:
 
 
 class Tokenizer:
-    def __init__(self, root: Path, configured: str):
+    def __init__(self, root: Path, configured: str, *, defer_writes: bool = False):
         self.root = root
         self.configured = configured
+        self.defer_writes = defer_writes
+        self.dirty = False
+        self._identity_cache: tuple[str, str] | None = None
         self.cache_path = root / ".ctxpp/token-cache.json"
         try:
             self.cache = json.loads(self.cache_path.read_text(encoding="utf-8"))
@@ -303,6 +534,44 @@ class Tokenizer:
             return TokenCount(len(encoding.encode(text)), True, f"tiktoken:{encoding_name}", getattr(tiktoken, "__version__", "unknown"))
         return None
 
+    def _cache_identity(self) -> tuple[str, str]:
+        if self._identity_cache is not None:
+            return self._identity_cache
+        if self.configured.startswith("external:"):
+            argv = shlex.split(self.configured.split(":", 1)[1])
+            fingerprints = []
+            for index, token in enumerate(argv):
+                candidate = Path(shutil.which(token) or token) if index == 0 else Path(token)
+                if not candidate.is_absolute():
+                    candidate = self.root / candidate
+                try:
+                    candidate = candidate.resolve()
+                except OSError:
+                    pass
+                if candidate.is_file():
+                    stat = candidate.stat()
+                    # Hash adapters exactly. Large interpreter binaries contribute their installed
+                    # identity without rereading tens of MiB on every short query.
+                    identity = sha256_file(candidate) if index or stat.st_size <= 4 * 1024**2 else f"{stat.st_size}:{stat.st_mtime_ns}"
+                    fingerprints.append((str(candidate), identity))
+            version = sha256_bytes(stable_json(fingerprints).encode())[:16] if fingerprints else "external-v1"
+            self._identity_cache = (self.configured, f"external-v1:{version}")
+            return self._identity_cache
+        if self.configured == "auto" or self.configured.startswith("tiktoken:"):
+            try:
+                import tiktoken  # type: ignore
+                encoding_name = self.configured.split(":", 1)[1] if ":" in self.configured else "cl100k_base"
+                self._identity_cache = (f"tiktoken:{encoding_name}", getattr(tiktoken, "__version__", "unknown"))
+                return self._identity_cache
+            except ModuleNotFoundError:
+                pass
+        self._identity_cache = ("utf8-bytes/4", "estimate-v1")
+        return self._identity_cache
+
+    def cache_identity(self) -> str:
+        identity, version = self._cache_identity()
+        return f"{self.configured}:{identity}:{version}"
+
     @staticmethod
     def _estimate(text: str) -> int:
         if not text:
@@ -311,16 +580,40 @@ class Tokenizer:
         return max(1, (len(text.encode("utf-8")) + 3) // 4)
 
     def count(self, text: str) -> TokenCount:
+        work_count("tokenizer_calls")
         content_hash = sha256_bytes(text.encode("utf-8"))
-        cache_key = f"{self.configured}:{content_hash}"
+        identity, version = self._cache_identity()
+        cache_key = f"{self.configured}:{identity}:{version}:{content_hash}"
         cached = self.cache.get(cache_key)
         if isinstance(cached, dict):
+            work_count("token_cache_hits")
             return TokenCount(int(cached["count"]), bool(cached["exact"]), str(cached["identity"]), str(cached["version"]))
+        work_count("token_cache_misses")
         result = self._adapter(text) or TokenCount(self._estimate(text), False, "utf8-bytes/4", "estimate-v1")
         self.cache[cache_key] = result.__dict__
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write(self.cache_path, (stable_json(self.cache) + "\n").encode())
+        self.dirty = True
+        if not self.defer_writes:
+            self.flush()
         return result
+
+    def flush(self) -> None:
+        if not self.dirty:
+            return
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.cache_path.with_suffix(self.cache_path.suffix + ".lock")
+        with lock_path.open("a+b") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                try:
+                    current = json.loads(self.cache_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    current = {}
+                current.update(self.cache)
+                atomic_write(self.cache_path, (stable_json(current) + "\n").encode())
+                self.cache = current
+                self.dirty = False
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def language_standard(args: Iterable[str]) -> str:
@@ -350,16 +643,30 @@ def index_dir(root: Path) -> Path:
     return root / ".ctxpp"
 
 
+_INDEX_CACHE: dict[Path, tuple[tuple[int, int, int], list[dict[str, Any]]]] = {}
+
+
 def load_index(root: Path) -> list[dict[str, Any]]:
     path = index_dir(root) / "index.jsonl"
     if not path.is_file():
         raise CtxppError("semantic index missing; run ctxpp scan")
+    stat = path.stat()
+    identity = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    cached = _INDEX_CACHE.get(path)
+    if cached and cached[0] == identity:
+        work_count("index_cache_hits")
+        return cached[1]
+    work_count("index_cache_misses")
+    work_count("bytes_read_from_index", stat.st_size)
     result = []
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    with span("index_load"):
+        lines = path.read_text(encoding="utf-8").splitlines()
+    for number, line in enumerate(lines, 1):
         try:
             result.append(json.loads(line))
         except json.JSONDecodeError as exc:
             raise CtxppError(f"invalid index record at line {number}: {exc}") from exc
+    _INDEX_CACHE[path] = (identity, result)
     return result
 
 
@@ -369,6 +676,23 @@ def partition_index(records: list[dict[str, Any]]) -> tuple[dict[str, Any], list
     symbols = [x for x in records if x.get("record") == "symbol"]
     edges = [x for x in records if x.get("record") == "edge"]
     return meta, files, symbols, edges
+
+
+def index_meta(root: Path) -> dict[str, Any]:
+    store = open_query_store(root)
+    if store:
+        try:
+            return store.meta()
+        finally:
+            store.close()
+    path = index_dir(root) / "index.jsonl"
+    if not path.is_file():
+        raise CtxppError("semantic index missing; run ctxpp scan")
+    try:
+        with path.open(encoding="utf-8") as stream:
+            return json.loads(stream.readline())
+    except json.JSONDecodeError as exc:
+        raise CtxppError(f"invalid index record at line 1: {exc}") from exc
 
 
 def _merge_core_records(core_records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -416,6 +740,7 @@ def _merge_core_records(core_records: list[dict[str, Any]]) -> tuple[list[dict[s
     return symbols, edges, sorted(observations, key=lambda x: (x.get("file", ""), stable_json(x)))
 
 
+@timed("semantic_graph_reconstruction")
 def enrich_semantic_edges(root: Path, symbols: list[dict[str, Any]], edges: list[dict[str, Any]]) -> list[dict[str, Any]]:
     by_id = {s["id"]: s for s in symbols}
     callable_kinds = {"FunctionDecl", "CXXMethod", "CXXConstructor", "CXXDestructor", "FunctionTemplate", "ConversionFunction"}
@@ -448,69 +773,190 @@ def enrich_semantic_edges(root: Path, symbols: list[dict[str, Any]], edges: list
     return sorted(merged.values(), key=lambda x: (x.get("type", ""), x.get("from", ""), x.get("to", ""), x.get("file", ""), x.get("start", 0)))
 
 
-def scan_repository(root: Path, cfg: dict[str, Any], skill_root: Path, scoped: Iterable[str] = ()) -> dict[str, Any]:
-    paths = source_paths(root, cfg, scoped)
+def scan_repository(root: Path, cfg: dict[str, Any], skill_root: Path, scoped: Iterable[str] = (), *,
+                    refresh_tus: set[str] | None = None) -> dict[str, Any]:
     compdb_path = find_compdb(root, cfg)
-    compdb = read_compdb(compdb_path)
-    by_file = compdb_by_file(compdb)
+    compdb = read_compdb(compdb_path, root)
+    observed = observed_records(root)
+    prior_recipes = successful_records(root)
+    paths = source_paths(root, cfg, scoped, [*compdb, *observed, *prior_recipes])
+    by_file = compdb_by_file([*compdb, *observed, *prior_recipes])
     core = find_core(skill_root)
-    tokenizer = Tokenizer(root, str(cfg.get("tokenizer", "auto")))
+    tokenizer = Tokenizer(root, str(cfg.get("tokenizer", "auto")), defer_writes=True)
     core_ok = False
     core_version = "unavailable"
+    core_hash = ""
     if core:
-        doctor = run_core(core, ["doctor"])
-        core_ok = doctor.returncode == 0
-        if core_ok:
+        doctor_cache_path = index_dir(root) / "cache/core-doctor.json"
+        stat = core.stat()
+        try:
+            cached_doctor = json.loads(doctor_cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            cached_doctor = {}
+        if (cached_doctor.get("path") == str(core) and cached_doctor.get("size") == stat.st_size
+                and cached_doctor.get("mtime_ns") == stat.st_mtime_ns):
+            core_ok = bool(cached_doctor.get("ok"))
+            core_version = str(cached_doctor.get("version", "unknown"))
+            core_hash = str(cached_doctor.get("hash", ""))
+        else:
+            doctor = run_core(core, ["doctor"])
+            core_ok = doctor.returncode == 0
+            core_hash = sha256_file(core)
             try:
-                core_version = json.loads(doctor.stdout.splitlines()[0]).get("version", "unknown")
+                core_version = json.loads(doctor.stdout.splitlines()[0]).get("version", "unknown") if core_ok else "unavailable"
             except (json.JSONDecodeError, IndexError):
                 core_version = "unknown"
+            atomic_write(doctor_cache_path, (stable_json({"format": "CTXPP-CORE-CACHE/1", "path": str(core),
+                                                         "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+                                                         "hash": core_hash, "ok": core_ok, "version": core_version}) + "\n").encode())
 
     raw_core: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     command_facts: dict[str, list[dict[str, Any]]] = {}
     cache_hits = 0
-    if core_ok and compdb_path:
-        core_hash = sha256_file(core)
-        input_hash = sha256_bytes(stable_json({p.relative_to(root).as_posix(): sha256_file(p) for p in paths}).encode())
+    jobs: list[dict[str, Any]] = []
+    state_payload: dict[str, Any] | None = None
+    if core_ok and (compdb or observed or prior_recipes or tuple(scoped)):
         cache_dir = index_dir(root) / "cache/tu"
-        jobs = []
-        for file, commands in sorted(by_file.items(), key=lambda x: str(x[0])):
+        state_path = index_dir(root) / "cache/tu-state.json"
+        try:
+            previous_state = json.loads(state_path.read_text(encoding="utf-8"))
+            previous_jobs = previous_state.get("jobs", {}) if previous_state.get("format") == "CTXPP-TU-CACHE/1" else {}
+        except (OSError, json.JSONDecodeError):
+            previous_jobs = {}
+        hash_cache: dict[str, str | None] = {}
+
+        def current_hash(rel: str) -> str | None:
+            if rel not in hash_cache:
+                path = root / rel
+                hash_cache[rel] = sha256_file(path) if path.is_file() else None
+            return hash_cache[rel]
+
+        scoped_values = tuple(scoped)
+        recipe_files: dict[Path, list[tuple[dict[str, Any], str, float]]] = {}
+        for file, commands in by_file.items():
+            recipe_files[file] = [(record, str(record.get("origin", "compile_database")), 1.0) for record in commands]
+        if scoped_values:
+            templates = [*compdb, *observed, *prior_recipes]
+            for file in paths:
+                if file.suffix not in (".cc", ".cpp", ".cxx", ".cu") or file in recipe_files:
+                    continue
+                record, origin, confidence = infer_recipe(file, templates)
+                if record:
+                    recipe_files[file] = [(record, origin, confidence)]
+        for file, recipes in sorted(recipe_files.items(), key=lambda x: str(x[0])):
             try:
                 rel = file.relative_to(root).as_posix()
             except ValueError:
                 continue
             if is_excluded(rel, cfg) or file.suffix not in SOURCE_EXTENSIONS:
                 continue
-            for number, record in enumerate(commands):
-                args = normalized_clang_args(record, file)
+            for number, (record, origin, confidence) in enumerate(recipes):
+                translated = translate_recipe(record, file)
+                args = translated["clang_argv"]
+                needs_preflight = Path(str(translated.get("compiler_identity", ""))).name == "nvcc" or origin.startswith("inferred")
                 command_hash = sha256_bytes(stable_json({"directory": record.get("directory"), "args": args}).encode())
-                command_facts.setdefault(rel, []).append({"hash": command_hash, "standard": language_standard(args), "args": args, "directory": record.get("directory", str(root))})
-                cache_key = sha256_bytes(stable_json({"file": sha256_file(file), "command": command_hash, "inputs": input_hash,
+                command_facts.setdefault(rel, []).append({"hash": command_hash, "standard": language_standard(args), "args": args,
+                    "directory": record.get("directory", str(root)), "origin": origin, "confidence": confidence,
+                    "source_rewrite_usable": origin in ("compile_database", "observed_standalone")})
+                state_key = f"{rel}\0{number}"
+                prior = previous_jobs.get(state_key, {})
+                source_hash = current_hash(rel)
+                input_fingerprint = sha256_bytes(stable_json({"file": source_hash, "command": command_hash,
+                                                              "core": core_version, "core_hash": core_hash, "tool": VERSION}).encode())
+                cache_key = sha256_bytes(stable_json({"tu": rel, "configuration": number, "command": command_hash,
                                                       "core": core_version, "core_hash": core_hash, "tool": VERSION}).encode())
                 jobs.append({"file": file, "rel": rel, "number": number, "record": record, "args": args,
-                             "command_hash": command_hash, "cache": cache_dir / f"{cache_key}.jsonl"})
+                             "origin": origin,
+                             "translated": translated, "needs_preflight": needs_preflight,
+                             "command_hash": command_hash, "cache": cache_dir / f"{cache_key}.jsonl", "state_key": state_key,
+                             "prior": prior, "source_hash": source_hash, "input_fingerprint": input_fingerprint,
+                             "history_key": sha256_bytes(f"parse\0{rel}\0{command_hash}".encode()), "size": file.stat().st_size,
+                             "cuda": file.suffix in (".cu", ".cuh"),
+                             "memory_floor_mb": 1024 if file.suffix in (".cu", ".cuh") else 256})
 
         outputs: dict[tuple[str, int], tuple[int, str, str, bool]] = {}
         pending = []
         for job in jobs:
-            if job["cache"].is_file():
+            prior = job["prior"]
+            dependencies = prior.get("dependencies", {}) if prior.get("input_fingerprint") == job["input_fingerprint"] else {}
+            dependencies_current = bool(dependencies) and all(current_hash(rel) == digest for rel, digest in dependencies.items())
+            targeted_reuse = refresh_tus is not None and job["rel"] not in refresh_tus and job["cache"].is_file() and bool(prior)
+            if job["cache"].is_file() and (dependencies_current or targeted_reuse):
                 outputs[(job["rel"], job["number"])] = (0, job["cache"].read_text(encoding="utf-8"), "", True)
                 cache_hits += 1
             else:
-                pending.append(job)
+                usable, preflight_error = recipe_preflight(job["translated"], job["file"]) if job["needs_preflight"] else (True, "")
+                if usable:
+                    pending.append(job)
+                else:
+                    outputs[(job["rel"], job["number"])] = (1, "", preflight_error, False)
 
-        def execute(job: dict[str, Any]) -> tuple[dict[str, Any], subprocess.CompletedProcess[str]]:
-            proc = run_core(core, ["scan", "--root", str(root), "--file", str(job["file"]), "--", *job["args"]],
-                            cwd=Path(job["record"].get("directory", root)))
-            return job, proc
+        if refresh_tus is None and not tuple(scoped) and not pending:
+            current = index_status(root, cfg)
+            try:
+                manifest_files = set(json.loads((index_dir(root) / "manifest.json").read_text(encoding="utf-8")).get("files", {}))
+            except (OSError, json.JSONDecodeError):
+                manifest_files = set()
+            inventory_files = {path.relative_to(root).as_posix() for path in paths}
+            if current.get("present") and not current.get("stale") and manifest_files == inventory_files:
+                tokenizer.flush()
+                return {"backend": current.get("backend"), "files": current.get("files", 0),
+                        "symbols": current.get("symbols", 0), "edges": current.get("edges", 0),
+                        "failures": len(current.get("failures", [])), "cache_hits": cache_hits,
+                        "index": str(index_dir(root) / "index.jsonl")}
 
-        workers = max(1, min(int(cfg.get("tool", {}).get("max_workers", 4)), os.cpu_count() or 1))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            for job, proc in pool.map(execute, pending):
-                outputs[(job["rel"], job["number"])] = (proc.returncode, proc.stdout, proc.stderr, False)
-                if proc.returncode == 0:
-                    atomic_write(job["cache"], proc.stdout.encode())
+        def execute(job: dict[str, Any]) -> ParseExecution:
+            measured = run_process_measured(
+                [str(core), "scan", "--root", str(root), "--file", str(job["file"]), "--", *job["args"]],
+                cwd=Path(job["record"].get("directory", root)),
+            )
+            return ParseExecution(job, measured.completed, measured.peak_memory_mb)
+
+        configured_ceiling = cfg.get("tool", {}).get("max_workers")
+        scheduler = ResourceScheduler(root, int(configured_ceiling) if isinstance(configured_ceiling, int) and configured_ceiling > 0 else None)
+        completed_jobs = scheduler.run(pending, execute)
+        next_state: dict[str, Any] = {job["state_key"]: dict(job["prior"]) for job in jobs if job not in pending and job["prior"]}
+        stale_during_scan = False
+        for execution in completed_jobs:
+            job, proc = execution.job, execution.completed
+            if (sha256_file(job["file"]) if job["file"].is_file() else None) != job["source_hash"]:
+                work_count("stale_parse_results_rejected")
+                outputs[(job["rel"], job["number"])] = (1, "", "source changed during parse", False)
+                stale_during_scan = True
+                continue
+            outputs[(job["rel"], job["number"])] = (proc.returncode, proc.stdout, proc.stderr, False)
+            if proc.returncode == 0:
+                dependencies = {job["rel"]: str(job["source_hash"])}
+                for line in proc.stdout.splitlines():
+                    try:
+                        parsed = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    candidate = str(parsed.get("file", ""))
+                    path = root / candidate
+                    if candidate and path.is_file() and not is_excluded(candidate, cfg):
+                        dependencies[candidate] = str(current_hash(candidate))
+                    if parsed.get("record") == "include":
+                        included = str(parsed.get("to", ""))
+                        included_path = root / included
+                        if included and included_path.is_file() and not is_excluded(included, cfg):
+                            dependencies[included] = str(current_hash(included))
+                if any((sha256_file(root / rel) if (root / rel).is_file() else None) != digest for rel, digest in dependencies.items()):
+                    work_count("stale_parse_results_rejected")
+                    outputs[(job["rel"], job["number"])] = (1, "", "dependency changed during parse", False)
+                    stale_during_scan = True
+                    continue
+                atomic_write(job["cache"], proc.stdout.encode())
+                persist_successful(root, job["record"], job["file"], job["origin"], atomic_write)
+                next_state[job["state_key"]] = {"cache": job["cache"].name, "input_fingerprint": job["input_fingerprint"],
+                                                "dependencies": dict(sorted(dependencies.items()))}
+                work_count("tus_parsed")
+                work_count("asts_constructed")
+                work_count("semantic_records_updated", len(proc.stdout.splitlines()))
+        if stale_during_scan:
+            raise CtxppError("source changed during semantic scan; stale results discarded; retry")
+        state_payload = {"format": "CTXPP-TU-CACHE/1", "jobs": dict(sorted(next_state.items()))}
 
         for job in sorted(jobs, key=lambda x: (x["rel"], x["number"])):
             returncode, stdout, stderr, _ = outputs[(job["rel"], job["number"])]
@@ -526,6 +972,8 @@ def scan_repository(root: Path, cfg: dict[str, Any], skill_root: Path, scoped: I
                 except json.JSONDecodeError as exc:
                     failures.append({"file": job["rel"], "configuration": job["number"], "error": f"invalid core JSON: {exc}"})
     symbols, edges, observations = _merge_core_records(raw_core)
+    symbols.extend(lexical_symbols(root, paths, symbols))
+    symbols.sort(key=lambda x: (x.get("qualified_name", ""), x.get("file", ""), x.get("start", 0), x["id"]))
     edges = enrich_semantic_edges(root, symbols, edges)
     for obs in observations:
         for diagnostic in obs.get("diagnostics", []):
@@ -541,6 +989,9 @@ def scan_repository(root: Path, cfg: dict[str, Any], skill_root: Path, scoped: I
         for occurrence in symbol.get("occurrences", []):
             if occurrence.get("translation_unit"):
                 tus_by_file.setdefault(occurrence.get("file", symbol.get("file", "")), set()).add(occurrence["translation_unit"])
+    for record in raw_core:
+        if record.get("record") == "include" and record.get("to") and record.get("translation_unit"):
+            tus_by_file.setdefault(str(record["to"]), set()).add(str(record["translation_unit"]))
     observations_by_tu = {obs.get("translation_unit", obs.get("file", "")): obs for obs in observations}
     known_paths = {p.relative_to(root).as_posix(): p for p in paths}
     for symbol in symbols:
@@ -569,53 +1020,293 @@ def scan_repository(root: Path, cfg: dict[str, Any], skill_root: Path, scoped: I
             "includes": sorted({e.get("to") for e in raw_core if e.get("record") == "include" and e.get("from") == rel}),
             "route": None,
         })
-    backend = "libclang-runtime" if core_ok and compdb_path and symbols else "degraded-text-routing"
+    semantic_symbols = [symbol for symbol in symbols if not symbol.get("degraded")]
+    lexical_count = len(symbols) - len(semantic_symbols)
+    backend = "libclang-runtime" if core_ok and semantic_symbols else "degraded-text-routing"
     meta = {
         "record": "meta", "format": "CTXPP-INDEX/1", "tool_version": VERSION, "root": str(root),
         "generated_at": 0, "deterministic": True, "backend": backend, "semantic": backend != "degraded-text-routing",
         "core_version": core_version, "compilation_database": str(compdb_path) if compdb_path else None,
-        "config_hash": sha256_bytes(stable_json(cfg).encode()), "failures": failures,
-        "incomplete": backend == "degraded-text-routing" or bool(failures),
+        "config_hash": sha256_bytes(stable_json(cfg).encode()), "failures": summarize_diagnostics(root, failures, "scan"),
+        "coverage": {"semantic": len(semantic_symbols), "lexical_only": lexical_count},
+        "incomplete": backend == "degraded-text-routing" or bool(failures) or bool(lexical_count),
     }
     output_records = [meta, *files, *symbols, *edges]
     out_dir = index_dir(root)
     out_dir.mkdir(parents=True, exist_ok=True)
-    atomic_write(out_dir / "index.jsonl", ("\n".join(stable_json(x) for x in output_records) + "\n").encode())
-    manifest = {"format": "CTXPP-MANIFEST/1", "index_hash": sha256_file(out_dir / "index.jsonl"), "files": {f["path"]: f["hash"] for f in files}}
-    atomic_write(out_dir / "manifest.json", (stable_json(manifest) + "\n").encode())
+    index_data = ("\n".join(stable_json(x) for x in output_records) + "\n").encode()
+    index_hash = sha256_bytes(index_data)
+    manifest = {"format": "CTXPP-MANIFEST/1", "index_hash": index_hash, "files": {f["path"]: f["hash"] for f in files}}
+    try:
+        build_query_store(root, index_hash, files, symbols, edges,
+                          {**meta, "_profile": cfg.get("profile"), "_source_write": bool(cfg.get("source_write"))})
+    except Exception:
+        # Private acceleration is disposable; readers retain the compatible public index.
+        pass
+    with publication_lock(root):
+        checked_jobs = jobs if refresh_tus is None else [job for job in jobs if job["rel"] in refresh_tus]
+        for job in checked_jobs:
+            expected = state_payload.get("jobs", {}).get(job["state_key"], {}).get("dependencies", {}) if state_payload else {}
+            if expected and any(not (root / rel).is_file() or sha256_file(root / rel) != digest for rel, digest in expected.items()):
+                work_count("stale_parse_results_rejected")
+                raise CtxppError(f"source changed during semantic scan: {job['rel']}; retry")
+        atomic_write(out_dir / "index.jsonl", index_data)
+        atomic_write(out_dir / "manifest.json", (stable_json(manifest) + "\n").encode())
+        if state_payload is not None:
+            atomic_write(out_dir / "cache/tu-state.json", (stable_json(state_payload) + "\n").encode())
+        freshness = {f["path"]: {"hash": f["hash"], "size": (root / f["path"]).stat().st_size,
+                                  "mtime_ns": (root / f["path"]).stat().st_mtime_ns} for f in files if (root / f["path"]).is_file()}
+        config_path = root / ".ctxpp.toml"
+        freshness_payload = {"format": "CTXPP-FRESHNESS/1", "files": freshness,
+                             "config_file_hash": sha256_file(config_path) if config_path.is_file() else None}
+        atomic_write(out_dir / "cache/freshness.json", (stable_json(freshness_payload) + "\n").encode())
+        stale_semantic_tus = [] if refresh_tus is None else sorted(set(
+            job["rel"] for job in jobs if job["rel"] not in refresh_tus and any(
+                (root / rel).is_file() and sha256_file(root / rel) != digest
+                for rel, digest in job.get("prior", {}).get("dependencies", {}).items())))
+        readiness = {"format": "CTXPP-READINESS/1", "semantic_stale_tus": stale_semantic_tus,
+                     "route_ready": True, "read_ready": not stale_semantic_tus,
+                     "rewrite_ready": not stale_semantic_tus and not failures and not lexical_count and backend != "degraded-text-routing"}
+        atomic_write(out_dir / "cache/readiness.json", (stable_json(readiness) + "\n").encode())
+    tokenizer.flush()
     return {"backend": backend, "files": len(files), "symbols": len(symbols), "edges": len(edges), "failures": len(failures),
             "cache_hits": cache_hits, "index": str(out_dir / "index.jsonl")}
 
 
 def index_status(root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
+    store = open_query_store(root)
     try:
-        records = load_index(root)
+        if store:
+            meta = store.meta()
+            files = store.files()
+            file_count, symbol_count, edge_count = store.counts()
+        else:
+            records = load_index(root)
+            meta, files, symbols, edges = partition_index(records)
+            file_count, symbol_count, edge_count = len(files), len(symbols), len(edges)
     except CtxppError:
         return {"present": False, "stale": True, "reasons": ["index-missing"]}
-    meta, files, symbols, edges = partition_index(records)
+    finally:
+        if store:
+            store.close()
+    try:
+        freshness_payload = json.loads((index_dir(root) / "cache/freshness.json").read_text(encoding="utf-8"))
+        freshness = freshness_payload.get("files", {}) if freshness_payload.get("format") == "CTXPP-FRESHNESS/1" else {}
+    except (OSError, json.JSONDecodeError):
+        freshness = {}
     reasons = []
+    git_dirty = git_dirty_paths(root)
+    try:
+        readiness = json.loads((index_dir(root) / "cache/readiness.json").read_text(encoding="utf-8"))
+        stale_tus = readiness.get("semantic_stale_tus", []) if readiness.get("format") == "CTXPP-READINESS/1" else []
+    except (OSError, json.JSONDecodeError):
+        stale_tus = []
     if meta.get("config_hash") != sha256_bytes(stable_json(cfg).encode()):
         reasons.append("config-changed")
     for f in files:
         path = root / f["path"]
         if not path.is_file():
             reasons.append(f"missing:{f['path']}")
-        elif sha256_file(path) != f.get("hash"):
-            reasons.append(f"changed:{f['path']}")
+        else:
+            stat = path.stat()
+            prior = freshness.get(f["path"], {})
+            metadata_same = prior.get("size") == stat.st_size and prior.get("mtime_ns") == stat.st_mtime_ns
+            trusted_clean = metadata_same and git_dirty is not None and f["path"] not in git_dirty
+            if not trusted_clean:
+                if sha256_file(path) != f.get("hash"):
+                    reasons.append(f"changed:{f['path']}")
+    reasons.extend(f"semantic-stale:{rel}" for rel in stale_tus)
     return {
         "present": True, "stale": bool(reasons), "reasons": reasons[:20], "backend": meta.get("backend"),
-        "semantic": bool(meta.get("semantic")), "incomplete": bool(meta.get("incomplete")), "failures": meta.get("failures", []),
-        "files": len(files), "symbols": len(symbols), "edges": len(edges), "profile": cfg.get("profile"),
+        "semantic": bool(meta.get("semantic")), "incomplete": bool(meta.get("incomplete")),
+        "failures": summarize_diagnostics(root, list(meta.get("failures", [])), "status"),
+        "files": file_count, "symbols": symbol_count, "edges": edge_count, "profile": cfg.get("profile"),
         "source_write_configured": bool(cfg.get("source_write")),
         "source_write_safe": bool(cfg.get("source_write")) and bool(meta.get("semantic")) and not reasons and not meta.get("failures"),
     }
 
 
+def _lexical_identifiers(data: bytes) -> set[str]:
+    """Conservative C++ lexical anchors only; never used as semantic proof."""
+    text = data.decode("utf-8", errors="replace")
+    result: set[str] = set()
+    i = 0
+    while i < len(text):
+        if text.startswith("//", i):
+            end = text.find("\n", i + 2)
+            i = len(text) if end < 0 else end + 1
+            continue
+        if text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = len(text) if end < 0 else end + 2
+            continue
+        char = text[i]
+        if char in ('"', "'"):
+            quote = char
+            i += 1
+            while i < len(text):
+                if text[i] == "\\":
+                    i += 2
+                elif text[i] == quote:
+                    i += 1
+                    break
+                else:
+                    i += 1
+            continue
+        if char == "_" or char.isalpha():
+            start = i
+            i += 1
+            while i < len(text) and (text[i] == "_" or text[i].isalnum()):
+                i += 1
+            identifier = text[start:i]
+            result.add(identifier.lower())
+            result.update(ranked_terms(identifier))
+            continue
+        i += 1
+    return result
+
+
+def ensure_query_fresh(root: Path, cfg: dict[str, Any], skill_root: Path, query: str) -> bool:
+    """Refresh only selected stale TUs; clean or unrelated queries remain compiler-free."""
+    store = open_query_store(root)
+    overlay_matches = [symbol for symbol in lexical_overlay(root)
+                       if query in (symbol.get("id"), symbol.get("name"), symbol.get("qualified_name"))]
+    exact_matches = overlay_matches
+    if store:
+        try:
+            files = store.files()
+            exact_matches = store.exact(query, 8) or overlay_matches
+            exact_cached = bool(exact_matches)
+        finally:
+            store.close()
+    else:
+        files = []
+        exact_cached = bool(exact_matches)
+    recipe_files = set()
+    for record in [*observed_records(root), *successful_records(root)]:
+        directory = Path(record.get("directory", root))
+        source = Path(record.get("file", ""))
+        source = source if source.is_absolute() else directory / source
+        try: recipe_files.add(source.resolve().relative_to(root).as_posix())
+        except (OSError, ValueError): pass
+    promotion = sorted({str(symbol.get("file", "")) for symbol in exact_matches
+                        if symbol.get("degraded") and symbol.get("file") in recipe_files})
+    if promotion:
+        scan_repository(root, cfg, skill_root, promotion)
+        return True
+    if not exact_cached:
+        query_anchors = [term for term in query_terms(query) if len(term) > 1]
+        for path in source_paths(root, cfg):
+            identifiers = _lexical_identifiers(path.read_bytes())
+            work_count("files_lexically_refreshed")
+            candidates = lexical_symbols(root, [path], []) if query.isidentifier() else []
+            exact_declaration = any(query in (symbol.get("name"), symbol.get("qualified_name")) for symbol in candidates)
+            if exact_declaration or (not query.isidentifier() and query_anchors and all(term in identifiers for term in query_anchors)):
+                refresh_lexical_overlay(root, [path])
+                return True
+    if not store:
+        return False
+    try:
+        freshness_payload = json.loads((index_dir(root) / "cache/freshness.json").read_text(encoding="utf-8"))
+        freshness = freshness_payload.get("files", {})
+    except (OSError, json.JSONDecodeError):
+        freshness = {}
+    try:
+        readiness = json.loads((index_dir(root) / "cache/readiness.json").read_text(encoding="utf-8"))
+        logical_stale = set(readiness.get("semantic_stale_tus", []))
+    except (OSError, json.JSONDecodeError):
+        logical_stale = set()
+    dirty: set[str] = set()
+    git_dirty = git_dirty_paths(root)
+    for record in files:
+        rel = str(record.get("path", ""))
+        source = root / rel
+        prior = freshness.get(rel, {})
+        if not source.is_file():
+            dirty.add(rel)
+            continue
+        stat = source.stat()
+        work_count("files_statted")
+        metadata_same = stat.st_size == prior.get("size") and stat.st_mtime_ns == prior.get("mtime_ns")
+        trusted_clean = metadata_same and git_dirty is not None and rel not in git_dirty
+        if not trusted_clean:
+            if sha256_file(source) != record.get("hash"):
+                dirty.add(rel)
+    matches = resolve_symbols(root, query, 24)
+    selected_files = {str(symbol.get("file", "")) for symbol in matches}
+    by_file = {str(record.get("path", "")): record for record in files}
+    refresh: set[str] = set()
+    preferred_tus = {str(tu) for rel in selected_files for tu in by_file.get(rel, {}).get("translation_units", [])
+                     if Path(rel).suffix in (".cc", ".cpp", ".cxx", ".cu")}
+    selected_tus = {str(tu) for rel in selected_files for tu in by_file.get(rel, {}).get("translation_units", [])}
+
+    def add_tus(rel: str) -> None:
+        record = by_file.get(rel, {})
+        tus = sorted(str(tu) for tu in record.get("translation_units", []))
+        if tus:
+            relevant = [tu for tu in tus if tu in preferred_tus]
+            refresh.update(relevant or tus[:1])
+        elif Path(rel).suffix in (".cc", ".cpp", ".cxx", ".cu"):
+            refresh.add(rel)
+
+    for rel in selected_files:
+        record = by_file.get(rel, {})
+        tus = set(str(x) for x in record.get("translation_units", []))
+        if rel in dirty or tus & logical_stale:
+            add_tus(rel)
+    try:
+        tu_state = json.loads((index_dir(root) / "cache/tu-state.json").read_text(encoding="utf-8")).get("jobs", {})
+    except (OSError, json.JSONDecodeError):
+        tu_state = {}
+    for key, record in tu_state.items():
+        tu = key.split("\0", 1)[0]
+        if tu in selected_tus and any(rel in dirty for rel in record.get("dependencies", {})):
+            refresh.add(tu)
+    terms = [term for term in query_terms(query) if len(term) > 1]
+    location_file = query.rpartition(":")[0] if query.rpartition(":")[2].isdigit() else ""
+    for rel in sorted(dirty):
+        source = root / rel
+        if not source.is_file():
+            add_tus(rel)
+            continue
+        identifiers = _lexical_identifiers(source.read_bytes())
+        work_count("files_lexically_refreshed")
+        if rel == location_file or (terms and all(term in identifiers for term in terms)):
+            add_tus(rel)
+    refresh.update(logical_stale & {tu for rel in selected_files for tu in by_file.get(rel, {}).get("translation_units", [])})
+    if not refresh:
+        return False
+    scan_repository(root, cfg, skill_root, refresh_tus=refresh)
+    return True
+
+
 def resolve_symbols(root: Path, target: str, limit: int = 8) -> list[dict[str, Any]]:
+    overlay = lexical_overlay(root)
+    overlay_exact = [symbol for symbol in overlay if target in (symbol.get("id"), symbol.get("name"), symbol.get("qualified_name"))]
+    if overlay_exact:
+        return sorted(overlay_exact, key=lambda symbol: (symbol.get("qualified_name") != target, symbol.get("file", "")))[:limit]
+    store = open_query_store(root)
+    if store:
+        try:
+            if target.startswith(("usr:", "c:")):
+                exact = [s for s in store.exact(target, limit) if s.get("id") == target]
+                if exact:
+                    return exact
+            if ":" in target:
+                maybe_file, _, maybe_line = target.rpartition(":")
+                if maybe_line.isdigit():
+                    return store.location(maybe_file, int(maybe_line), limit)
+            exact = store.exact(target, limit)
+            if exact:
+                return sorted(exact, key=lambda s: (s.get("qualified_name") != target, not s.get("definition"), s.get("file", "")))[:limit]
+            query = query_terms(target)
+            return rank_candidates(target, [*store.candidates(query), *overlay], limit)
+        finally:
+            store.close()
     records = load_index(root)
     _, files, symbols, _ = partition_index(records)
     if not symbols:
-        return degraded_locations(root, target, files, limit)
+        return rank_candidates(target, [*overlay, *degraded_locations(root, target, files, limit)], limit)
     if target.startswith("usr:") or target.startswith("c:"):
         exact = [s for s in symbols if s["id"] == target]
         if exact:
@@ -630,26 +1321,11 @@ def resolve_symbols(root: Path, target: str, limit: int = 8) -> list[dict[str, A
     if exact:
         return sorted(exact, key=lambda s: (s.get("qualified_name") != target, not s.get("definition"), s.get("file", "")))[:limit]
     query = query_terms(target)
-    ranked = []
-    for s in symbols:
-        hay = " ".join(str(s.get(k, "")) for k in ("qualified_name", "signature", "contract", "file")).lower()
-        score = sum(8 if term in str(s.get("qualified_name", "")).lower() else 3 if term in hay else 0 for term in query)
-        if score:
-            ranked.append((score, s))
-    return [s for _, s in sorted(ranked, key=lambda x: (-x[0], x[1].get("qualified_name", ""), x[1].get("file", "")))[:limit]]
+    return rank_candidates(target, [*symbols, *overlay], limit)
 
 
 def query_terms(query: str) -> list[str]:
-    term = []
-    result = []
-    for char in query.lower():
-        if char.isalnum() or char == "_":
-            term.append(char)
-        elif term:
-            result.append("".join(term)); term = []
-    if term:
-        result.append("".join(term))
-    return [x for x in result if x]
+    return ranked_terms(query)
 
 
 def degraded_locations(root: Path, target: str, files: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
@@ -667,27 +1343,28 @@ def degraded_locations(root: Path, target: str, files: list[dict[str, Any]], lim
     return results[:limit]
 
 
+@timed("route_ranking")
 def route_symbols(root: Path, query: str, limit: int = 8) -> list[dict[str, Any]]:
     matches = resolve_symbols(root, query, limit=limit * 3)
-    _, _, symbols, edges = partition_index(load_index(root))
-    by_id = {s["id"]: s for s in symbols}
     base_ids = {s.get("id") for s in matches}
+    store = open_query_store(root)
+    if store:
+        try:
+            edges = [edge for sid in sorted(base_ids) for edge in store.edges_for(str(sid))]
+            work_count("graph_edges_traversed", len(edges))
+            source_ids = {edge.get("from") for edge in edges if edge.get("type") == "test_relationship" and edge.get("to") in base_ids}
+            by_id = store.symbol_ids(source_ids)
+        finally:
+            store.close()
+    else:
+        _, _, symbols, edges = partition_index(load_index(root))
+        work_count("graph_edges_traversed", len(edges))
+        by_id = {s["id"]: s for s in symbols}
     for edge in edges:
         if edge.get("type") == "test_relationship" and edge.get("to") in base_ids and edge.get("from") in by_id:
             matches.append({**by_id[edge["from"]], "_route_test_bonus": 20})
     matches = list({s["id"]: s for s in matches}.values())
-    terms = query_terms(query)
-    ranked = []
-    for symbol in matches:
-        qname = str(symbol.get("qualified_name", "")).lower()
-        signature = str(symbol.get("signature", "")).lower()
-        contract = str(symbol.get("contract", "")).lower()
-        path = str(symbol.get("file", "")).lower()
-        score = sum(10 * (term in qname) + 4 * (term in signature) + 3 * (term in contract) + 2 * (term in path) for term in terms)
-        score += 2 * bool(symbol.get("definition"))
-        score += int(symbol.get("_route_test_bonus", 0))
-        ranked.append((score, symbol))
-    return [s for _, s in sorted(ranked, key=lambda x: (-x[0], x[1].get("qualified_name", ""), x[1].get("file", "")))[:limit]]
+    return rank_candidates(query, matches, limit)
 
 
 INTENT_EDGE_WEIGHT = {
@@ -702,6 +1379,7 @@ INTENT_EDGE_WEIGHT = {
 
 def source_text(root: Path, symbol: dict[str, Any]) -> str:
     data = (root / symbol["file"]).read_bytes()
+    work_count("source_bytes_read", len(data))
     start, end = int(symbol.get("start", 0)), int(symbol.get("end", 0))
     if not (0 <= start <= end <= len(data)):
         raise CtxppError(f"invalid source range for {symbol.get('qualified_name')}")
@@ -716,6 +1394,7 @@ def choose_fragments(root: Path, target: dict[str, Any], intent: str, budget: in
     candidates: dict[str, tuple[int, str]] = {}
     weights = INTENT_EDGE_WEIGHT[intent]
     for edge in edges:
+        work_count("graph_edges_traversed")
         if edge.get("from") == target_id and edge.get("to") in by_id:
             candidates[edge["to"]] = max(candidates.get(edge["to"], (0, "")), (weights.get(edge.get("type"), 10), edge.get("type", "reference")))
         if edge.get("to") == target_id and edge.get("from") in by_id:
@@ -756,6 +1435,7 @@ def choose_fragments(root: Path, target: dict[str, Any], intent: str, budget: in
     return selected, omitted, mandatory_total, sufficient
 
 
+@timed("slice_and_view_assembly")
 def render_bundle(root: Path, target: dict[str, Any], intent: str, budget: int, tokenizer: Tokenizer, *, compact: bool = False,
                   core: Path | None = None, layout: str = "navigable") -> tuple[str, dict[str, Any], dict[str, Any]]:
     selected, omitted, mandatory_total, sufficient = choose_fragments(root, target, intent, budget, tokenizer)
@@ -765,12 +1445,37 @@ def render_bundle(root: Path, target: dict[str, Any], intent: str, budget: int, 
     _, _, all_symbols, all_edges = partition_index(records)
     mappings = []
     glossary: dict[str, str] = {}
+    compacted_by_id: dict[str, tuple[str, list[dict[str, Any]]] | None] = {}
+    if compact and core:
+        compact_jobs = []
+        for item in selected:
+            if intent == "edit" and item["role"] == "target":
+                continue
+            symbol = item["symbol"]
+            compact_jobs.append({"history_key": f"compact:{symbol['id']}",
+                                 "input_fingerprint": sha256_bytes((sha256_file(root / symbol["file"]) + sha256_file(core)).encode()),
+                                 "size": int(symbol.get("end", 0)) - int(symbol.get("start", 0)),
+                                 "memory_floor_mb": 256,
+                                 "symbol": symbol})
+
+        @dataclass
+        class CompactExecution:
+            symbol_id: str
+            value: tuple[str, list[dict[str, Any]]] | None
+            peak_memory_mb: int = 512
+
+        def execute_compact(job: dict[str, Any]) -> CompactExecution:
+            work_count("compact_view_transforms")
+            return CompactExecution(job["symbol"]["id"], compact_range(root, core, job["symbol"]))
+
+        for result in ResourceScheduler(root).run(compact_jobs, execute_compact):
+            compacted_by_id[result.symbol_id] = result.value
     for item in selected:
         symbol = item["symbol"]
         text = item["text"]
         mode = "verbatim"
         if compact and not (intent == "edit" and item["role"] == "target") and core:
-            compacted = compact_range(root, core, symbol)
+            compacted = compacted_by_id.get(symbol["id"])
             if compacted:
                 text, token_maps = compacted
                 mode = "lexically-compacted"
@@ -909,13 +1614,20 @@ def abbreviate_generated_fragment(root: Path, container: dict[str, Any], text: s
         token_maps[:] = adjusted
     # Persist only stable semantic-ID assignments; the visible glossary remains slice-local.
     path = index_dir(root) / "abbreviations.json"
-    try:
-        persisted = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        persisted = {}
-    for symbol, short, _, _ in candidates:
-        persisted[symbol["id"]] = {"original": symbol["name"], "abbreviation": short, "rule": "VIEW-ABBR-1"}
-    atomic_write(path, (stable_json(persisted) + "\n").encode())
+    lock_path = index_dir(root) / "cache/abbreviations.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            try:
+                persisted = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                persisted = {}
+            for symbol, short, _, _ in candidates:
+                persisted[symbol["id"]] = {"original": symbol["name"], "abbreviation": short, "rule": "VIEW-ABBR-1"}
+            atomic_write(path, (stable_json(persisted) + "\n").encode())
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
     return updated, glossary, rename_maps
 
 
@@ -941,6 +1653,7 @@ def compact_range(root: Path, core: Path, symbol: dict[str, Any]) -> tuple[str, 
     proc = run_core(core, args, cwd=Path(command.get("directory", root)))
     if proc.returncode != 0:
         return None
+    work_count("asts_constructed", 2)
     try:
         result = json.loads(proc.stdout)
     except json.JSONDecodeError:
@@ -948,6 +1661,7 @@ def compact_range(root: Path, core: Path, symbol: dict[str, Any]) -> tuple[str, 
     return result["text"], result.get("maps", [])
 
 
+@timed("view_persistence")
 def persist_view(root: Path, text: str, source_map: dict[str, Any]) -> tuple[Path, Path]:
     digest = sha256_bytes((text + stable_json(source_map)).encode())[:16]
     view_dir = index_dir(root) / "views"
@@ -957,6 +1671,57 @@ def persist_view(root: Path, text: str, source_map: dict[str, Any]) -> tuple[Pat
     atomic_write(view_path, (banner + text).encode())
     atomic_write(map_path, (stable_json(source_map) + "\n").encode())
     return view_path, map_path
+
+
+def _view_request_path(root: Path, target: dict[str, Any], intent: str, budget: int, layout: str,
+                       tokenizer_config: str, core: Path | None) -> Path:
+    try:
+        manifest = json.loads((index_dir(root) / "manifest.json").read_text(encoding="utf-8"))
+        index_hash = str(manifest.get("index_hash", ""))
+    except (OSError, json.JSONDecodeError):
+        index_hash = ""
+    core_identity = sha256_file(core) if core and core.is_file() else "unavailable"
+    key = sha256_bytes(stable_json({
+        "schema": 1, "tool": VERSION, "index": index_hash, "target": target.get("id"),
+        "intent": intent, "budget": budget, "layout": layout, "tokenizer": tokenizer_config,
+        "core": core_identity,
+    }).encode())
+    return index_dir(root) / "cache/views" / f"{key}.json"
+
+
+def load_cached_view(root: Path, target: dict[str, Any], intent: str, budget: int, layout: str,
+                     tokenizer_config: str, core: Path | None) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
+    path = _view_request_path(root, target, intent, budget, layout, tokenizer_config, core)
+    try:
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        if cached.get("format") != "CTXPP-VIEW-CACHE/1":
+            return None
+        for rel, expected in cached.get("source_hashes", {}).items():
+            source = root / rel
+            if not source.is_file() or sha256_file(source) != expected:
+                work_count("view_cache_misses")
+                return None
+        work_count("view_cache_hits")
+        return str(cached["text"]), dict(cached["source_map"]), dict(cached["report"])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError):
+        work_count("view_cache_misses")
+        return None
+
+
+def save_cached_view(root: Path, target: dict[str, Any], intent: str, budget: int, layout: str,
+                     tokenizer_config: str, core: Path | None, text: str, source_map: dict[str, Any],
+                     report: dict[str, Any]) -> None:
+    source_hashes: dict[str, str] = {}
+    for mapping in source_map.get("mappings", []):
+        rel = str(mapping.get("canonical_file", ""))
+        source = root / rel
+        if rel and source.is_file():
+            source_hashes[rel] = sha256_file(source)
+    payload = {"format": "CTXPP-VIEW-CACHE/1", "source_hashes": dict(sorted(source_hashes.items())),
+               "text": text, "source_map": source_map, "report": report}
+    atomic_write(_view_request_path(root, target, intent, budget, layout, tokenizer_config, core),
+                 (stable_json(payload) + "\n").encode())
+    work_count("view_cache_writes")
 
 
 def git_baseline(root: Path) -> dict[str, Any]:
@@ -1234,7 +1999,7 @@ def apply_plan(root: Path, cfg: dict[str, Any], plan_path: Path) -> dict[str, An
         if semantic["failures"]:
             raise CtxppError("semantic reparse failed after applying plan")
         for tier, command in verification_commands(plan):
-            proc = subprocess.run(command, cwd=root, shell=True, text=True, capture_output=True, check=False)
+            proc = run_captured(root, str(command), root, atomic_write)
             verification.append({"tier": tier, "command": command, "returncode": proc.returncode,
                                  "stdout": proc.stdout[-4000:], "stderr": proc.stderr[-4000:]})
             if proc.returncode != 0:
@@ -1281,6 +2046,7 @@ def apply_plan(root: Path, cfg: dict[str, Any], plan_path: Path) -> dict[str, An
     return {**report, "report": str(report_path)}
 
 
+@timed("verification")
 def verify_commands(root: Path, cfg: dict[str, Any], tiers: Iterable[str] = ()) -> list[dict[str, Any]]:
     selected = set(tiers)
     results = []
@@ -1288,7 +2054,7 @@ def verify_commands(root: Path, cfg: dict[str, Any], tiers: Iterable[str] = ()) 
         if selected and tier not in selected:
             continue
         for command in cfg.get("verification", {}).get(tier, []):
-            proc = subprocess.run(str(command), cwd=root, shell=True, text=True, capture_output=True, check=False)
+            proc = run_captured(root, str(command), root, atomic_write)
             results.append({"tier": tier, "command": command, "returncode": proc.returncode,
                             "stdout": proc.stdout[-4000:], "stderr": proc.stderr[-4000:]})
     return results
