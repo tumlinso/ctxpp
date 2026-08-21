@@ -96,6 +96,22 @@ class IntegrationTests(unittest.TestCase):
         overloads = json.loads(self.ctxpp("where", "overloaded").stdout)
         self.assertEqual(len(overloads["matches"]), 2)
 
+    def test_warm_and_incremental_scan_do_not_materialize_unchanged_tu_payloads(self) -> None:
+        self.scan()
+        warm = self.profiled("warm-scan", "scan")["counters"]
+        self.assertEqual(warm.get("tus_parsed", 0), 0)
+        self.assertEqual(warm.get("asts_constructed", 0), 0)
+        self.assertEqual(warm.get("semantic_records_updated", 0), 0)
+        self.assertEqual(warm.get("tu_cache_payloads_materialized", 0), 0)
+
+        source = self.root / "src/other.cpp"
+        source.write_bytes(source.read_bytes() + b"\n")
+        incremental = self.profiled("incremental-scan", "scan")["counters"]
+        self.assertEqual(incremental.get("tus_parsed", 0), 1)
+        self.assertEqual(incremental.get("tu_cache_payloads_materialized", 0), 0)
+        found = json.loads(self.ctxpp("where", "demo::call_overload").stdout)
+        self.assertEqual(found["matches"][0]["file"], "src/other.cpp")
+
     def test_hot_queries_and_lazy_targeted_refresh_use_minimum_tus(self) -> None:
         self.scan()
         for number, command in enumerate((
