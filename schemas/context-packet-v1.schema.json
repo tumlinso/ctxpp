@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ctxpp.local/schemas/context-packet-v1.schema.json",
+  "title": "ctxpp context packet v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "schema_version", "readonly", "request", "source_identity", "target", "context", "invariants", "trust", "coverage", "expansions", "estimated_tokens", "packet_hash"],
+  "properties": {
+    "format": {"const": "CTXPP-CONTEXT-PACKET/1"},
+    "schema_version": {"const": 1},
+    "readonly": {"const": true},
+    "request": {
+      "type": "object", "additionalProperties": false,
+      "required": ["target", "intent", "budget_tokens", "max_items"],
+      "properties": {
+        "target": {"type": "string", "minLength": 1},
+        "intent": {"enum": ["understand", "edit", "debug", "test", "api", "performance"]},
+        "budget_tokens": {"type": "integer", "minimum": 1},
+        "max_items": {"type": "integer", "minimum": 1, "maximum": 64}
+      }
+    },
+    "source_identity": {"$ref": "../../contracts/source-identity-v1.schema.json"},
+    "target": {"$ref": "#/$defs/target"},
+    "context": {
+      "type": "object", "additionalProperties": false,
+      "required": ["types", "dependencies", "callers", "callees", "tests"],
+      "properties": {
+        "types": {"$ref": "#/$defs/relations"},
+        "dependencies": {"$ref": "#/$defs/relations"},
+        "callers": {"$ref": "#/$defs/relations"},
+        "callees": {"$ref": "#/$defs/relations"},
+        "tests": {"$ref": "#/$defs/relations"}
+      }
+    },
+    "invariants": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["kind", "text", "path", "line"],
+        "properties": {
+          "kind": {"type": "string", "minLength": 1},
+          "text": {"type": "string", "minLength": 1},
+          "path": {"type": "string", "minLength": 1},
+          "line": {"type": "integer", "minimum": 1}
+        }
+      }
+    },
+    "trust": {
+      "type": "object", "additionalProperties": false,
+      "required": ["canonical_source", "target_range", "relationships", "index_backend", "index_semantic", "index_incomplete", "index_sha256"],
+      "properties": {
+        "canonical_source": {"const": "authoritative"},
+        "target_range": {"enum": ["hash-verified", "unverified"]},
+        "relationships": {"enum": ["semantic", "lexical-or-partial"]},
+        "index_backend": {"type": "string"},
+        "index_semantic": {"type": "boolean"},
+        "index_incomplete": {"type": "boolean"},
+        "index_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "coverage": {
+      "type": "object", "additionalProperties": false,
+      "required": ["sufficient", "target_complete", "representation_kind", "omitted", "budget_exceeded"],
+      "properties": {
+        "sufficient": {"type": "boolean"},
+        "budget_exceeded": {"type": "boolean"},
+        "target_complete": {"type": "boolean"},
+        "representation_kind": {"type": "string"},
+        "omitted": {
+          "type": "object", "additionalProperties": false,
+          "required": ["types", "dependencies", "callers", "callees", "tests"],
+          "properties": {
+            "types": {"type": "integer", "minimum": 0},
+            "dependencies": {"type": "integer", "minimum": 0},
+            "callers": {"type": "integer", "minimum": 0},
+            "callees": {"type": "integer", "minimum": 0},
+            "tests": {"type": "integer", "minimum": 0}
+          }
+        }
+      }
+    },
+    "expansions": {"type": "array", "maxItems": 2, "items": {"$ref": "#/$defs/expansion"}},
+    "estimated_tokens": {"type": "integer", "minimum": 1},
+    "packet_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "location": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "line", "end_line", "byte_start", "byte_end", "content_sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "line": {"type": "integer", "minimum": 1},
+        "end_line": {"type": "integer", "minimum": 1},
+        "byte_start": {"type": "integer", "minimum": 0},
+        "byte_end": {"type": "integer", "minimum": 0},
+        "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "target": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "name", "kind", "signature", "type", "definition", "canonical", "location", "text_sha256", "content"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "name": {"type": "string", "minLength": 1},
+        "kind": {"type": "string", "minLength": 1},
+        "signature": {"type": "string"},
+        "type": {"type": "string"},
+        "definition": {"type": "boolean"},
+        "canonical": {"const": true},
+        "location": {"$ref": "#/$defs/location"},
+        "text_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "content": {"type": "string"}
+      }
+    },
+    "relation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "name", "kind", "relation", "direction", "location", "semantic"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "name": {"type": "string", "minLength": 1},
+        "kind": {"type": "string", "minLength": 1},
+        "relation": {"type": "string", "minLength": 1},
+        "direction": {"enum": ["incoming", "outgoing"]},
+        "location": {"oneOf": [{"$ref": "#/$defs/location"}, {"type": "null"}]},
+        "semantic": {"type": "boolean"}
+      }
+    },
+    "relations": {"type": "array", "items": {"$ref": "#/$defs/relation"}},
+    "expansion": {
+      "type": "object", "additionalProperties": false,
+      "required": ["handle", "kind", "target", "argv"],
+      "properties": {
+        "handle": {"type": "string", "pattern": "^ctxpp:"},
+        "kind": {"enum": ["canonical-source", "more-context"]},
+        "target": {"type": "string", "minLength": 1},
+        "argv": {"type": "array", "minItems": 2, "items": {"type": "string"}}
+      }
+    }
+  }
+}

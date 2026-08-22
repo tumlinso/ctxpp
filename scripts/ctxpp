@@ -25,6 +25,7 @@ from ctxpp_lib import (  # noqa: E402
     resolve_symbols, route_symbols, scan_repository, semantic_local_rename_plan, shard_plan, source_text,
     save_cached_view, stable_json, verify_commands, view_cache_lock,
 )
+from ctxpp_packet import build_context_packet, render_inspect  # noqa: E402
 
 
 def parser() -> argparse.ArgumentParser:
@@ -38,6 +39,10 @@ def parser() -> argparse.ArgumentParser:
     scan = sub.add_parser("scan"); scan.add_argument("paths", nargs="*")
     where = sub.add_parser("where"); where.add_argument("target"); where.add_argument("--limit", type=int, default=8)
     route = sub.add_parser("route"); route.add_argument("query"); route.add_argument("--limit", type=int, default=8)
+    for name in ("packet", "inspect"):
+        cmd = sub.add_parser(name); cmd.add_argument("target")
+        cmd.add_argument("--intent", choices=("understand", "edit", "debug", "test", "api", "performance"), default="edit")
+        cmd.add_argument("--budget", type=int); cmd.add_argument("--max-items", type=int, default=12)
     for name in ("slice", "view"):
         cmd = sub.add_parser(name); cmd.add_argument("target"); cmd.add_argument("--intent", choices=("understand", "edit", "debug", "test", "api", "performance"), default="understand")
         cmd.add_argument("--budget", type=int); cmd.add_argument("--depth", type=int, default=1)
@@ -174,6 +179,23 @@ def main(argv: list[str] | None = None) -> int:
             matches = resolve_symbols(root, args.target, args.limit) if args.command == "where" else route_symbols(root, args.query, args.limit)
             result = {"format": f"CTXPP-{args.command.upper()}/1", "incomplete": not bool(index_meta(root).get("semantic")),
                       "matches": [{k: s.get(k) for k in ("id", "qualified_name", "kind", "file", "line", "definition", "degraded")} for s in matches]}
+        elif args.command in ("packet", "inspect"):
+            ensure_query_fresh(root, cfg, skill_root, args.target)
+            matches = resolve_symbols(root, args.target, 8)
+            if not matches:
+                raise CtxppError(f"target not found: {args.target}")
+            if len(matches) > 1 and not any(args.target == symbol.get(key) for symbol in matches for key in ("id", "qualified_name")):
+                result = {"format": "CTXPP-AMBIGUOUS/1", "candidates": [
+                    {"id": symbol["id"], "name": symbol.get("qualified_name"), "file": symbol.get("file"), "line": symbol.get("line")}
+                    for symbol in matches
+                ]}
+            else:
+                tokenizer = Tokenizer(root, str(cfg.get("tokenizer", "auto")), defer_writes=True)
+                budget = args.budget or int(cfg.get("budgets", {}).get("default_slice_tokens", 2400))
+                packet = build_context_packet(root, args.target, matches[0], intent=args.intent, budget=budget,
+                                              max_items=args.max_items, tokenizer=tokenizer)
+                tokenizer.flush()
+                result = packet if args.command == "packet" or args.json else render_inspect(packet)
         elif args.command in ("slice", "view"):
             ensure_query_fresh(root, cfg, skill_root, args.target)
             matches = resolve_symbols(root, args.target, 8)
