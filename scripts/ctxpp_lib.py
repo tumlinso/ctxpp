@@ -1472,7 +1472,14 @@ def ensure_query_fresh(root: Path, cfg: dict[str, Any], skill_root: Path, query:
             exact_declaration = any(query in (symbol.get("name"), symbol.get("qualified_name")) for symbol in candidates)
             if exact_declaration or (not query.isidentifier() and query_anchors and all(term in identifiers for term in query_anchors)):
                 refresh_lexical_overlay(root, [path])
-                return True
+                try:
+                    rel = path.resolve().relative_to(root.resolve()).as_posix()
+                except (OSError, ValueError):
+                    return True
+                indexed = next((record for record in files if record.get("path") == rel), None)
+                if not indexed or not indexed.get("translation_units"):
+                    return True
+                break
     if not store:
         return False
     try:

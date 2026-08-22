@@ -167,6 +167,8 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(counters.get("tus_parsed", 0), 1)
         found = json.loads(self.ctxpp("where", "demo::newly_added_api").stdout)
         self.assertEqual(found["matches"][0]["file"], "include/empty.hpp")
+        self.assertEqual(found["matches"][0]["qualified_name"], "demo::newly_added_api")
+        self.assertFalse(found["matches"][0].get("degraded"))
 
     def test_external_tokenizer_cache_invalidates_when_adapter_changes(self) -> None:
         adapter = self.root / "token-count.py"
