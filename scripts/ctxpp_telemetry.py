@@ -35,17 +35,25 @@ class BoundedPacketTelemetry:
         local_worker_success: bool | None = None,
         accepted_patch: bool | None = None,
         codex_reinvestigation: bool | None = None,
+        extra_source_reads: int | None = None,
+        worker_result: str | None = None,
     ) -> dict[str, Any]:
         packet_tokens = tokenizer.count(stable_json(packet)).count
         compact_tokens = tokenizer.count(compact_text).count
-        target_tokens = tokenizer.count(str(packet["target"]["content"])).count
+        if "target" in packet:
+            target_tokens = tokenizer.count(str(packet["target"]["content"])).count
+        else:
+            target_tokens = sum(tokenizer.count(str(item["content"])).count for item in packet.get("canonical_targets", []))
         trust = packet.get("trust", {})
         freshness = {
-            "canonical_target": trust.get("target_range") == "hash-verified",
+            "canonical_target": (
+                trust.get("target_range") == "hash-verified"
+                or trust.get("freshness") == "hash-verified"
+            ),
             "relationships": (
                 trust.get("relationships") == "semantic"
                 and not trust.get("index_incomplete", True)
-            ),
+            ) if packet.get("schema_version") == 1 else trust.get("relationships") == "semantic",
         }
         event = {
             "budget_tokens": int(packet["request"]["budget_tokens"]),
@@ -62,6 +70,10 @@ class BoundedPacketTelemetry:
             "accepted_patch": accepted_patch,
             "codex_reinvestigation": codex_reinvestigation,
         }
+        if extra_source_reads is not None:
+            event["extra_source_reads"] = max(0, int(extra_source_reads))
+        if worker_result is not None:
+            event["worker_result"] = str(worker_result)
         self._events.append(event)
         return dict(event)
 

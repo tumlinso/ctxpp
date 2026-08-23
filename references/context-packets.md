@@ -15,3 +15,25 @@ ctxpp --json packet demo::PackingPlan::freeze --intent edit --budget 2400 --max-
 ctxpp inspect src/plan.cpp:15
 ctxpp --json inspect c:@N@demo@S@PackingPlan@F@freeze#I#
 ```
+
+## Task packet v2
+
+The local-worker front door accepts a JSON task specification from a path,
+inline value, or stdin:
+
+```text
+ctxpp --json packet --task-spec - --consumer local-worker --budget 2400
+```
+
+The task spec may declare an objective, role or intent, read/write/forbidden
+paths, multiple target symbols, diagnostics, failing tests, interface IDs,
+changed files, and acceptance gates. Intent is one of `investigate`, `debug`,
+`edit`, `test`, `review`, or `performance` and controls deterministic support
+ranking.
+
+`CTXPP-CONTEXT-PACKET/2` separates hash-verified canonical edit targets from
+compact semantic support. Trust reports `sufficient_for`, `missing_required`,
+`omitted_optional`, confidence, freshness, and canonical source authority.
+Source identity uses todo-orchestrator's supported implementation when it is
+importable and records its algorithm/version; standalone operation retains the
+compatible ctxpp fallback. Packet v1 and all earlier commands remain supported.

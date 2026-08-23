@@ -25,7 +25,7 @@ from ctxpp_lib import (  # noqa: E402
     resolve_symbols, route_symbols, scan_repository, semantic_local_rename_plan, shard_plan, source_text,
     save_cached_view, stable_json, verify_commands, view_cache_lock,
 )
-from ctxpp_packet import build_context_packet, render_inspect  # noqa: E402
+from ctxpp_packet import build_context_packet, build_task_packet, render_inspect, render_task_inspect  # noqa: E402
 
 
 def parser() -> argparse.ArgumentParser:
@@ -40,8 +40,10 @@ def parser() -> argparse.ArgumentParser:
     where = sub.add_parser("where"); where.add_argument("target"); where.add_argument("--limit", type=int, default=8)
     route = sub.add_parser("route"); route.add_argument("query"); route.add_argument("--limit", type=int, default=8)
     for name in ("packet", "inspect"):
-        cmd = sub.add_parser(name); cmd.add_argument("target")
-        cmd.add_argument("--intent", choices=("understand", "edit", "debug", "test", "api", "performance"), default="edit")
+        cmd = sub.add_parser(name); cmd.add_argument("target", nargs="?")
+        cmd.add_argument("--task-spec")
+        cmd.add_argument("--consumer", default="local-worker")
+        cmd.add_argument("--intent", choices=("understand", "investigate", "edit", "debug", "test", "review", "api", "performance"), default="edit")
         cmd.add_argument("--budget", type=int); cmd.add_argument("--max-items", type=int, default=12)
     for name in ("slice", "view"):
         cmd = sub.add_parser(name); cmd.add_argument("target"); cmd.add_argument("--intent", choices=("understand", "edit", "debug", "test", "api", "performance"), default="understand")
@@ -160,6 +162,21 @@ def print_result(value, as_json: bool) -> None:
         print(value, end="" if value.endswith("\n") else "\n")
 
 
+def load_task_spec(value: str) -> dict:
+    if value == "-":
+        payload = sys.stdin.read()
+    else:
+        path = Path(value)
+        payload = path.read_text(encoding="utf-8") if path.is_file() else value
+    try:
+        result = json.loads(payload)
+    except json.JSONDecodeError as error:
+        raise CtxppError(f"invalid task spec JSON: {error}") from error
+    if not isinstance(result, dict):
+        raise CtxppError("task spec must be a JSON object")
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     root = args.root.resolve() if args.command == "init" and args.root else (find_root(args.root).resolve() if args.root else find_root())
@@ -180,6 +197,50 @@ def main(argv: list[str] | None = None) -> int:
             result = {"format": f"CTXPP-{args.command.upper()}/1", "incomplete": not bool(index_meta(root).get("semantic")),
                       "matches": [{k: s.get(k) for k in ("id", "qualified_name", "kind", "file", "line", "definition", "degraded")} for s in matches]}
         elif args.command in ("packet", "inspect"):
+            if args.task_spec:
+                if args.target:
+                    raise CtxppError("target and --task-spec are mutually exclusive")
+                spec = load_task_spec(args.task_spec)
+                intent = str(spec.get("intent") or spec.get("role") or args.intent)
+                role_aliases = {"reviewer": "review", "worker": "edit", "tester": "test"}
+                intent = role_aliases.get(intent, intent)
+                requested = [str(item) for item in spec.get("target_symbols", spec.get("symbols", []))]
+                if not requested:
+                    objective = str(spec.get("objective", "")).strip()
+                    if not objective:
+                        raise CtxppError("task spec requires objective or target symbols")
+                    ensure_query_fresh(root, cfg, skill_root, objective)
+                    requested = [str(item["id"]) for item in route_symbols(root, objective, 4)]
+                resolved = []
+                seen = set()
+                for query in requested:
+                    ensure_query_fresh(root, cfg, skill_root, query)
+                    candidates = resolve_symbols(root, query, 8)
+                    if not candidates:
+                        raise CtxppError(f"target not found: {query}")
+                    exact_matches = [
+                        item for item in candidates
+                        if query in (item.get("id"), item.get("qualified_name"))
+                    ]
+                    exact = next(
+                        (item for item in exact_matches if item.get("definition")),
+                        exact_matches[0] if exact_matches else candidates[0],
+                    )
+                    if exact["id"] not in seen:
+                        resolved.append((query, exact))
+                        seen.add(exact["id"])
+                tokenizer = Tokenizer(root, str(cfg.get("tokenizer", "auto")), defer_writes=True)
+                budget = args.budget or int(cfg.get("budgets", {}).get("default_slice_tokens", 2400))
+                packet = build_task_packet(
+                    root, spec, resolved, consumer=args.consumer, intent=intent,
+                    budget=budget, max_items=args.max_items, tokenizer=tokenizer,
+                )
+                tokenizer.flush()
+                result = packet if args.command == "packet" or args.json else render_task_inspect(packet)
+                print_result(result, args.json)
+                return 0
+            if not args.target:
+                raise CtxppError("packet target or --task-spec is required")
             ensure_query_fresh(root, cfg, skill_root, args.target)
             matches = resolve_symbols(root, args.target, 8)
             if not matches:

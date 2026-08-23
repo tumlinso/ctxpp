@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,19 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
 
 
 def source_identity(root: Path, relevant_paths: list[str]) -> dict[str, Any]:
+    sibling = Path(__file__).resolve().parents[2] / "todo-orchestrator"
+    added = False
+    try:
+        if sibling.is_dir() and str(sibling) not in sys.path:
+            sys.path.insert(0, str(sibling))
+            added = True
+        from todo_orchestrator.runtime import capture_source_identity
+        return dict(capture_source_identity(root))
+    except (ImportError, OSError, RuntimeError, ValueError):
+        pass
+    finally:
+        if added:
+            sys.path.remove(str(sibling))
     head_result = _git(root, "rev-parse", "HEAD")
     head = head_result.stdout.decode().strip() if head_result.returncode == 0 else None
     status_result = _git(root, "-c", "status.relativePaths=true", "status", "--porcelain=v1", "-z", "--untracked-files=all")
@@ -54,6 +68,25 @@ def source_identity(root: Path, relevant_paths: list[str]) -> dict[str, Any]:
         "dirty_paths": sorted(set(dirty_paths)),
         "fingerprint": fingerprint,
     }
+
+
+INTENT_ALIASES = {
+    "investigate": "understand",
+    "debug": "debug",
+    "edit": "edit",
+    "test": "test",
+    "review": "understand",
+    "performance": "performance",
+}
+
+INTENT_ORDER = {
+    "investigate": ("callers", "tests", "dependencies", "callees", "types"),
+    "debug": ("callers", "callees", "dependencies", "tests", "types"),
+    "edit": ("types", "dependencies", "callers", "tests", "callees"),
+    "test": ("tests", "callers", "dependencies", "types", "callees"),
+    "review": ("callers", "dependencies", "tests", "callees", "types"),
+    "performance": ("callees", "callers", "types", "dependencies", "tests"),
+}
 
 
 def _line_for_offset(path: Path, offset: int) -> int:
@@ -280,6 +313,99 @@ def build_context_packet(root: Path, requested_target: str, target: dict[str, An
     return packet
 
 
+def build_task_packet(root: Path, task_spec: dict[str, Any], targets: list[tuple[str, dict[str, Any]]], *,
+                      consumer: str, intent: str, budget: int, max_items: int,
+                      tokenizer: Tokenizer) -> dict[str, Any]:
+    if intent not in INTENT_ALIASES:
+        raise CtxppError(f"unsupported task packet intent: {intent}")
+    if not targets:
+        raise CtxppError("task packet requires at least one resolved target symbol")
+    per_target_budget = max(256, budget // len(targets))
+    packets = [
+        build_context_packet(
+            root, requested, target, intent=INTENT_ALIASES[intent],
+            budget=per_target_budget, max_items=max_items, tokenizer=tokenizer,
+        )
+        for requested, target in targets
+    ]
+    canonical_targets = [packet["target"] for packet in packets]
+    order = INTENT_ORDER[intent]
+    support: dict[str, list[dict[str, Any]]] = {key: [] for key in order}
+    omitted_optional: dict[str, int] = {key: 0 for key in order}
+    remaining = max_items
+    for key in order:
+        unique: dict[str, dict[str, Any]] = {}
+        for packet in packets:
+            for item in packet["context"].get(key, []):
+                unique[stable_json({field: item.get(field) for field in ("id", "relation", "direction", "location")})] = item
+            omitted_optional[key] += int(packet["coverage"]["omitted"].get(key, 0))
+        values = sorted(unique.values(), key=lambda item: (item["name"], item["relation"], item["id"]))
+        support[key] = values[:remaining]
+        omitted_optional[key] += max(0, len(values) - len(support[key]))
+        remaining -= len(support[key])
+    source = dict(source_identity(root, [item["location"]["path"] for item in canonical_targets]))
+    source["algorithm"] = "todo-runtime-source-identity" if sibling_runtime_available() else "ctxpp-source-identity"
+    source["algorithm_version"] = 1
+    required_paths = sorted({str(path) for key in ("read_paths", "write_paths") for path in task_spec.get(key, [])})
+    represented_paths = {item["location"]["path"] for item in canonical_targets}
+    missing_required = [path for path in required_paths if path not in represented_paths and (root / path).is_file()]
+    fresh = all(packet["trust"]["target_range"] == "hash-verified" for packet in packets)
+    semantic = all(packet["trust"]["relationships"] == "semantic" for packet in packets)
+    budget_exceeded = any(packet["coverage"]["budget_exceeded"] for packet in packets)
+    sufficient_for = [] if missing_required or not fresh else [intent]
+    confidence = "high" if fresh and semantic and not missing_required else ("medium" if fresh else "low")
+    expansions = [
+        _handle("canonical-source", target["id"], ["expand", target["id"]])
+        for target in canonical_targets[:8]
+    ]
+    packet: dict[str, Any] = {
+        "format": "CTXPP-CONTEXT-PACKET/2",
+        "schema_version": 2,
+        "readonly": True,
+        "consumer": consumer,
+        "task_spec": task_spec,
+        "request": {
+            "intent": intent,
+            "budget_tokens": budget,
+            "max_items": max_items,
+            "target_count": len(canonical_targets),
+        },
+        "source_identity": source,
+        "canonical_targets": canonical_targets,
+        "semantic_support": support,
+        "invariants": [item for packet_v1 in packets for item in packet_v1["invariants"]],
+        "trust": {
+            "sufficient_for": sufficient_for,
+            "missing_required": missing_required,
+            "omitted_optional": omitted_optional,
+            "confidence": confidence,
+            "freshness": "hash-verified" if fresh else "partial",
+            "source_authority": "canonical-repository-source",
+            "relationships": "semantic" if semantic else "lexical-or-partial",
+        },
+        "expansions": expansions,
+        "budget_exceeded": budget_exceeded,
+    }
+    measured = {**packet, "estimated_tokens": 0, "packet_hash": "0" * 64}
+    estimated = tokenizer.count(stable_json(measured)).count
+    while estimated > budget and any(packet["semantic_support"].values()):
+        key = next(name for name in reversed(order) if packet["semantic_support"][name])
+        packet["semantic_support"][key].pop()
+        packet["trust"]["omitted_optional"][key] += 1
+        measured = {**packet, "estimated_tokens": 0, "packet_hash": "0" * 64}
+        estimated = tokenizer.count(stable_json(measured)).count
+    packet["budget_exceeded"] = estimated > budget
+    if packet["budget_exceeded"]:
+        packet["trust"]["sufficient_for"] = []
+    packet["estimated_tokens"] = estimated
+    packet["packet_hash"] = sha256_bytes(stable_json(packet).encode())
+    return packet
+
+
+def sibling_runtime_available() -> bool:
+    return (Path(__file__).resolve().parents[2] / "todo-orchestrator" / "todo_orchestrator" / "runtime").is_dir()
+
+
 def render_inspect(packet: dict[str, Any]) -> str:
     target = packet["target"]
     location = target["location"]
@@ -296,6 +422,25 @@ def render_inspect(packet: dict[str, Any]) -> str:
         lines.append("invariants: " + "; ".join(f"{item['kind']}:{item['text']}" for item in packet["invariants"]))
     omitted = sum(packet["coverage"]["omitted"].values())
     lines.append(f"packet sufficient={1 if packet['coverage']['sufficient'] else 0} tokens~={packet['estimated_tokens']} omitted={omitted}")
+    for expansion in packet["expansions"]:
+        lines.append("expand: ctxpp " + " ".join(expansion["argv"]))
+    return "\n".join(lines) + "\n"
+
+
+def render_task_inspect(packet: dict[str, Any]) -> str:
+    lines = [
+        f"task intent={packet['request']['intent']} consumer={packet['consumer']} targets={len(packet['canonical_targets'])}",
+    ]
+    for target in packet["canonical_targets"]:
+        location = target["location"]
+        lines.append(f"edit {location['path']}:{location['line']}-{location['end_line']} {target['name']}")
+    trust = packet["trust"]
+    lines.append(
+        f"trust confidence={trust['confidence']} freshness={trust['freshness']} "
+        f"sufficient_for={','.join(trust['sufficient_for']) or 'none'}"
+    )
+    if trust["missing_required"]:
+        lines.append("missing_required: " + ", ".join(trust["missing_required"]))
     for expansion in packet["expansions"]:
         lines.append("expand: ctxpp " + " ".join(expansion["argv"]))
     return "\n".join(lines) + "\n"

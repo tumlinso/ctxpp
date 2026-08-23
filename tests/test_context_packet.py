@@ -125,6 +125,54 @@ class ContextPacketTests(unittest.TestCase):
         self.assertEqual(ambiguous["format"], "CTXPP-AMBIGUOUS/1")
         self.assertEqual(len(ambiguous["candidates"]), 2)
 
+    def test_task_spec_packet_v2_supports_multiple_targets_and_intent_trust(self) -> None:
+        spec = json.dumps({
+            "objective": "Edit the freeze path and its candidate contract",
+            "role": "edit",
+            "read_paths": ["include/plan.hpp"],
+            "write_paths": ["src/plan.cpp"],
+            "forbidden_paths": ["vendor"],
+            "target_symbols": ["demo::PackingPlan::freeze", "demo::Candidate"],
+            "failing_tests": ["cpContextPacketTest"],
+            "interface_ids": ["ctxpp-task-packet-v2"],
+            "acceptance_gates": ["focused"],
+        })
+        packet = json.loads(self.ctxpp(
+            "packet", "--task-spec", spec, "--consumer", "local-worker",
+            "--budget", "30000", "--max-items", "32",
+        ).stdout)
+        self.assertEqual(packet["format"], "CTXPP-CONTEXT-PACKET/2")
+        self.assertEqual(packet["schema_version"], 2)
+        self.assertEqual(len(packet["canonical_targets"]), 2)
+        self.assertEqual(packet["consumer"], "local-worker")
+        self.assertIn("edit", packet["trust"]["sufficient_for"], packet["trust"] | {
+            "budget_exceeded": packet["budget_exceeded"],
+            "estimated_tokens": packet["estimated_tokens"],
+            "target_paths": [item["location"]["path"] for item in packet["canonical_targets"]],
+        })
+        self.assertEqual(packet["trust"]["missing_required"], [])
+        self.assertEqual(packet["source_identity"]["algorithm_version"], 1)
+        self.assertTrue(all(item["canonical"] for item in packet["canonical_targets"]))
+        unhashed = dict(packet)
+        digest = unhashed.pop("packet_hash")
+        encoded = json.dumps(unhashed, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        self.assertEqual(digest, hashlib.sha256(encoded).hexdigest())
+        schema = json.loads((SKILL / "schemas/context-packet-v2.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["format"]["const"], "CTXPP-CONTEXT-PACKET/2")
+
+    def test_task_spec_reports_missing_required_canonical_paths(self) -> None:
+        spec = json.dumps({
+            "objective": "Review freeze while requiring another source file",
+            "intent": "review",
+            "write_paths": ["src/other.cpp"],
+            "target_symbols": ["demo::PackingPlan::freeze"],
+        })
+        packet = json.loads(self.ctxpp(
+            "packet", "--task-spec", spec, "--budget", "10000", "--max-items", "16",
+        ).stdout)
+        self.assertEqual(packet["trust"]["missing_required"], ["src/other.cpp"])
+        self.assertEqual(packet["trust"]["sufficient_for"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ctxpp.local/schemas/context-packet-v2.schema.json",
+  "title": "ctxpp task context packet v2",
+  "type": "object",
+  "required": [
+    "format", "schema_version", "readonly", "consumer", "task_spec",
+    "request", "source_identity", "canonical_targets", "semantic_support",
+    "trust", "expansions", "estimated_tokens", "packet_hash"
+  ],
+  "properties": {
+    "format": {"const": "CTXPP-CONTEXT-PACKET/2"},
+    "schema_version": {"const": 2},
+    "readonly": {"const": true},
+    "consumer": {"type": "string", "minLength": 1},
+    "task_spec": {"type": "object"},
+    "request": {"type": "object"},
+    "source_identity": {
+      "type": "object",
+      "required": ["schema_version", "repo_root", "dirty_paths", "fingerprint", "algorithm", "algorithm_version"]
+    },
+    "canonical_targets": {
+      "type": "array", "minItems": 1,
+      "items": {"type": "object", "required": ["id", "name", "canonical", "location", "text_sha256", "content"]}
+    },
+    "semantic_support": {"type": "object"},
+    "invariants": {"type": "array"},
+    "trust": {
+      "type": "object",
+      "required": ["sufficient_for", "missing_required", "omitted_optional", "confidence", "freshness", "source_authority"]
+    },
+    "expansions": {"type": "array"},
+    "budget_exceeded": {"type": "boolean"},
+    "estimated_tokens": {"type": "integer", "minimum": 0},
+    "packet_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "additionalProperties": false
+}
