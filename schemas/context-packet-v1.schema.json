@@ -19,7 +19,7 @@
         "max_items": {"type": "integer", "minimum": 1, "maximum": 64}
       }
     },
-    "source_identity": {"$ref": "../../contracts/source-identity-v1.schema.json"},
+    "source_identity": {"$ref": "../../todo-orchestrator/schemas/runtime/source-identity-v1.schema.json"},
     "target": {"$ref": "#/$defs/target"},
     "context": {
       "type": "object", "additionalProperties": false,
