@@ -173,6 +173,25 @@ class ContextPacketTests(unittest.TestCase):
         self.assertEqual(packet["trust"]["missing_required"], ["src/other.cpp"])
         self.assertEqual(packet["trust"]["sufficient_for"], [])
 
+    def test_performance_task_packet_retains_accepted_path_and_campaign_routing(self) -> None:
+        spec = json.dumps({
+            "objective": "Measure the accepted freeze implementation for campaign freeze-latency",
+            "intent": "performance", "task_id": "CUDA-EDIT", "campaign_id": "freeze-latency",
+            "accepted_changed_paths": ["src/plan.cpp"], "read_paths": ["src/plan.cpp"],
+            "target_symbols": ["demo::PackingPlan::freeze"],
+        })
+        packet = json.loads(self.ctxpp(
+            "packet", "--task-spec", spec, "--consumer", "cuda", "--budget", "10000",
+        ).stdout)
+        self.assertEqual(packet["request"]["intent"], "performance")
+        self.assertEqual({key: packet["task_spec"][key] for key in (
+            "task_id", "campaign_id", "accepted_changed_paths",
+        )}, {
+            "task_id": "CUDA-EDIT", "campaign_id": "freeze-latency",
+            "accepted_changed_paths": ["src/plan.cpp"],
+        })
+        self.assertEqual(packet["consumer"], "cuda")
+
 
 if __name__ == "__main__":
     unittest.main()
