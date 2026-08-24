@@ -10,6 +10,7 @@ Canonical C++ is authoritative. `.ctxpp/` bundles are generated, read-only retri
 ## Route one mode
 
 - Retrieve: `status`; `where`/`route`; `slice --intent ...`. Read [retrieval](references/retrieval.md).
+- Task/CUDA route: use `packet --task-spec ... --consumer <name>` so accepted paths, task/campaign identity, canonical targets, and bounded performance context stay together.
 - Author: retrieve, edit canonical source, test, rescan/lint. Read [authoring](references/authoring.md); add [topology](references/topology.md) only for boundaries/shards.
 - Audit: `audit`, no mutation. Read [objective](references/objective.md).
 - Compact view: `view`; edit targets stay verbatim. Read [compact views](references/compact-views.md).
