@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -177,6 +177,35 @@ def load_task_spec(value: str) -> dict:
     return result
 
 
+def _task_authorized_paths(spec: dict) -> list[str]:
+    authorized: list[str] = []
+    for key in ("read_paths", "write_paths"):
+        values = spec.get(key, [])
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if not isinstance(value, str):
+                continue
+            path = PurePosixPath(value.replace("\\", "/"))
+            normalized = str(path)
+            if path.is_absolute() or normalized in {".", ".."} or ".." in path.parts:
+                continue
+            if normalized not in authorized:
+                authorized.append(normalized)
+    return authorized
+
+
+def _task_symbol_authorized(symbol: dict, authorized: list[str]) -> bool:
+    if not authorized:
+        return False
+    value = symbol.get("file")
+    if not isinstance(value, str) or not value:
+        return False
+    path = PurePosixPath(value.replace("\\", "/"))
+    normalized = str(path)
+    return any(normalized == scope or normalized.startswith(scope.rstrip("/") + "/") for scope in authorized)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     root = args.root.resolve() if args.command == "init" and args.root else (find_root(args.root).resolve() if args.root else find_root())
@@ -204,13 +233,21 @@ def main(argv: list[str] | None = None) -> int:
                 intent = str(spec.get("intent") or spec.get("role") or args.intent)
                 role_aliases = {"reviewer": "review", "worker": "edit", "tester": "test"}
                 intent = role_aliases.get(intent, intent)
+                authorized = _task_authorized_paths(spec)
+                strict_authorized = spec.get("strict_authorized_paths") is True
+                if strict_authorized and not authorized:
+                    raise CtxppError("task spec requires bounded read_paths or write_paths")
                 requested = [str(item) for item in spec.get("target_symbols", spec.get("symbols", []))]
                 if not requested:
                     objective = str(spec.get("objective", "")).strip()
                     if not objective:
                         raise CtxppError("task spec requires objective or target symbols")
                     ensure_query_fresh(root, cfg, skill_root, objective)
-                    requested = [str(item["id"]) for item in route_symbols(root, objective, 4)]
+                    routed = route_symbols(root, objective, 32 if strict_authorized else 4)
+                    requested = [str(item["id"]) for item in routed
+                                 if not strict_authorized or _task_symbol_authorized(item, authorized)][:4]
+                    if not requested:
+                        raise CtxppError("task objective has no target inside authorized source paths")
                 resolved = []
                 seen = set()
                 for query in requested:
@@ -218,6 +255,10 @@ def main(argv: list[str] | None = None) -> int:
                     candidates = resolve_symbols(root, query, 8)
                     if not candidates:
                         raise CtxppError(f"target not found: {query}")
+                    if strict_authorized:
+                        candidates = [item for item in candidates if _task_symbol_authorized(item, authorized)]
+                    if strict_authorized and not candidates:
+                        raise CtxppError(f"target is outside authorized source paths: {query}")
                     exact_matches = [
                         item for item in candidates
                         if query in (item.get("id"), item.get("qualified_name"))
