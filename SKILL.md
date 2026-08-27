@@ -7,12 +7,11 @@ description: Minimize Codex context for C++ by indexing symbols, generating budg
 
 ## Repository workflow
 
-For substantial repository work, ALWAYS use `coding-workflow` first when it is
-available. Claim or resume the authoritative task through `coding-workflow`
-before using this skill for bounded implementation, inspection, or testing. Do
-not directly claim todo work or begin repository mutations first. Use lower-level
-skill CLIs directly only when `coding-workflow` is unavailable, explicitly out
-of scope, or itself being debugged.
+For substantial repository work, use `coding-workflow`. Invoke this skill only
+for the bounded source operation and scope authorized by coding-workflow, when
+the user explicitly requests ctxpp maintenance, or while coding-workflow itself
+is being debugged. A fallback authorization states the permitted operation,
+scope, reason, and read/write mode; it never carries a todo token.
 
 Canonical C++ is authoritative. `.ctxpp/` bundles are generated, read-only retrieval artifacts; map edits back to canonical ranges.
 
