@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG "CMakeFiles/ctxpp-core.dir/src/main.cpp.o" "CMakeFiles/ctxpp-core.dir/src/clang_runtime.cpp.o" -o ctxpp-core  -ldl 
