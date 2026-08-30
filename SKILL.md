@@ -7,11 +7,12 @@ description: Minimize Codex context for C++ by indexing symbols, generating budg
 
 ## Repository workflow
 
-For substantial repository work, use `coding-workflow`. Invoke this skill only
-for the bounded source operation and scope authorized by coding-workflow, when
-the user explicitly requests ctxpp maintenance, or while coding-workflow itself
-is being debugged. A fallback authorization states the permitted operation,
-scope, reason, and read/write mode; it never carries a todo token.
+For substantial repository work, use the `project-control` Codex profile.
+Invoke this skill only for the bounded source operation and scope authorized by
+Project Control, when the user explicitly requests ctxpp maintenance, or while
+Project Control itself is being debugged. A fallback authorization states the
+permitted operation, scope, reason, and read/write mode; it never carries a todo
+token.
 
 Canonical C++ is authoritative. `.ctxpp/` bundles are generated, read-only retrieval artifacts; map edits back to canonical ranges.
 
