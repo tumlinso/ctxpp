@@ -83,11 +83,7 @@ def translate(record: dict[str, Any], source: Path) -> dict[str, Any]:
             args.append(f"--cuda-path={cuda_path}")
         if architecture:
             args.append(f"--cuda-gpu-arch={architecture}")
-    elif Path(compiler).name in {"g++", "gcc", "c++"}:
-        probe = subprocess.run([compiler, "-print-file-name=include"], text=True, capture_output=True, check=False)
-        include = probe.stdout.strip()
-        if probe.returncode == 0 and include and Path(include).is_dir():
-            args += ["-isystem", include]
+    # Preserve Clang builtin headers; GCC private intrinsics are incompatible.
     return {"directory": str(directory), "original_argv": argv, "clang_argv": args,
             "compiler_identity": compiler, "translations": translations,
             "preparation_diagnostics": diagnostics}

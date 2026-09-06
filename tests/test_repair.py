@@ -13,11 +13,24 @@ SKILL = Path(__file__).resolve().parents[1]
 SCRIPTS = SKILL / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from ctxpp_lib import load_config, summarize_diagnostics, verify_commands
+from ctxpp_lib import load_config, summarize_diagnostics, verify_commands, normalized_clang_args
 from ctxpp_recipe import translate
 
 
 class RepairTests(unittest.TestCase):
+    def test_gcc_commands_parse_intrinsics_with_clang_builtin_headers(self):
+        import shutil
+        compiler = shutil.which("clang++-18") or shutil.which("clang++")
+        if not compiler or not shutil.which("g++"):
+            self.skipTest("Clang and GCC required for mixed-driver regression")
+        source = self.root / "src/intrinsics.cpp"
+        source.write_text("#include <xmmintrin.h>\n__m128 add(__m128 a, __m128 b) { return _mm_add_ss(a,b); }\n")
+        args = normalized_clang_args({"directory": str(self.root), "arguments": ["g++", "-std=c++17", "-c", str(source)]}, source)
+        translated = translate({"directory": str(self.root), "arguments": ["g++", "-std=c++17", "-c", str(source)]}, source)["clang_argv"]
+        for command in (args, translated):
+            result = subprocess.run([compiler, "-fsyntax-only", *command, str(source)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name) / "repo"

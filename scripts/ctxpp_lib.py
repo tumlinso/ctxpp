@@ -293,12 +293,8 @@ def command_argv(record: dict[str, Any]) -> list[str]:
     return shlex.split(str(record.get("command", "")))
 
 
-_COMPILER_INCLUDE_CACHE: dict[str, str | None] = {}
-
-
 def normalized_clang_args(record: dict[str, Any], source: Path) -> list[str]:
     argv = command_argv(record)
-    compiler = argv[0] if argv else ""
     if argv:
         argv = argv[1:]
     result: list[str] = []
@@ -323,14 +319,8 @@ def normalized_clang_args(record: dict[str, Any], source: Path) -> list[str]:
         except OSError:
             pass
         result.append(arg)
-    if compiler and Path(compiler).name in ("g++", "c++", "gcc"):
-        if compiler not in _COMPILER_INCLUDE_CACHE:
-            probe = subprocess.run([compiler, "-print-file-name=include"], text=True, capture_output=True, check=False)
-            include = probe.stdout.strip()
-            _COMPILER_INCLUDE_CACHE[compiler] = include if probe.returncode == 0 and include and Path(include).is_dir() else None
-        include = _COMPILER_INCLUDE_CACHE[compiler]
-        if include:
-            result += ["-isystem", include]
+    # Clang must use its own builtin headers. Injecting GCC's private include
+    # directory shadows Clang intrinsics (xmmintrin.h) with incompatible builtins.
     return result
 
 
