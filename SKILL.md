@@ -5,6 +5,16 @@ description: Minimize Codex context for C++ by indexing symbols, generating budg
 
 # C++ Context Compiler
 
+## Native skill access
+
+Native coder, mutator and scout agents read installed `SKILL.md` and its
+references through filesystem/command access. Follow the skill's own routes;
+indexes and graphs accelerate navigation without becoming routing authority.
+No observer skill adapter or mandatory overview is needed for native use.
+Record materially applied guidance during the existing context/handoff flow,
+with skill hash and route relevance; a read alone remains merely consulted.
+See [native routing and handoff](../integrations/native-skill-routing.md).
+
 ## Repository workflow
 
 For substantial repository work, use the `project-control` Codex profile.
