@@ -24,7 +24,7 @@ Project Control itself is being debugged. A fallback authorization states the
 permitted operation, scope, reason, and read/write mode; it never carries a todo
 token.
 
-Canonical C++ is authoritative. `.ctxpp/` bundles are generated, read-only retrieval artifacts; map edits back to canonical ranges.
+Canonical C++ is authoritative. `.ctxpp/` bundles (or artifacts in `--state-dir`) are generated retrieval artifacts; map edits back to canonical ranges. Use `--read-only` with retrieval commands or `export` when the published index must not refresh or write caches.
 
 ## Route one mode
 

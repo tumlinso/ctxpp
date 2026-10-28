@@ -23,6 +23,7 @@ from ctxpp_runtime import (ResourceScheduler, build_query_store, count as work_c
 from ctxpp_rank import rank as rank_candidates, terms as ranked_terms
 from ctxpp_recipe import (infer as infer_recipe, observed_records, persist_successful, preflight as recipe_preflight,
                           run_captured, successful_records, translate as translate_recipe)
+from ctxpp_paths import state_dir
 
 try:
     import tomllib
@@ -97,7 +98,7 @@ def atomic_write(path: Path, data: bytes) -> None:
 
 @contextlib.contextmanager
 def publication_lock(root: Path):
-    path = root / ".ctxpp/cache/publish.lock"
+    path = state_dir(root) / "cache/publish.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b") as stream:
         fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
@@ -654,7 +655,7 @@ class Tokenizer:
         self.defer_writes = defer_writes
         self.dirty = False
         self._identity_cache: tuple[str, str] | None = None
-        self.cache_path = root / ".ctxpp/token-cache.json"
+        self.cache_path = state_dir(root) / "token-cache.json"
         try:
             self.cache = json.loads(self.cache_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -788,7 +789,7 @@ def classify_file(rel: str) -> str:
 
 
 def index_dir(root: Path) -> Path:
-    return root / ".ctxpp"
+    return state_dir(root)
 
 
 _INDEX_CACHE: dict[Path, tuple[tuple[int, int, int], list[dict[str, Any]]]] = {}
@@ -816,6 +817,37 @@ def load_index(root: Path) -> list[dict[str, Any]]:
             raise CtxppError(f"invalid index record at line {number}: {exc}") from exc
     _INDEX_CACHE[path] = (identity, result)
     return result
+
+
+def load_export(root: Path, state_path: Path | None = None) -> dict[str, Any]:
+    """Read the last published index without scanning, initializing, or mutating anything."""
+    root = root.resolve()
+    directory = state_path.resolve() if state_path else index_dir(root)
+    index_path = directory / "index.jsonl"
+    try:
+        records = []
+        with index_path.open(encoding="utf-8") as stream:
+            for number, line in enumerate(stream, 1):
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    raise CtxppError(f"invalid index record at line {number}: {exc}") from exc
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        freshness = json.loads((directory / "cache/freshness.json").read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise CtxppError(f"published index state is missing ({exc.filename}); run ctxpp scan explicitly") from exc
+    meta = next((record for record in records if record.get("record") == "meta"), None)
+    if not meta or meta.get("format") != "CTXPP-INDEX/1":
+        raise CtxppError("published index is not a supported CTXPP-INDEX/1 generation")
+    if Path(str(meta.get("root", ""))).resolve() != root:
+        raise CtxppError("published index belongs to a different source repository")
+    digest = sha256_bytes(index_path.read_bytes())
+    index_integrity = manifest.get("index_hash") == digest
+    if not index_integrity:
+        raise CtxppError("published index and manifest do not describe the same generation")
+    return {"format": "CTXPP-EXPORT/1", "root": str(root), "state_dir": str(directory),
+            "index_meta": meta, "manifest": manifest, "freshness": freshness, "records": records,
+            "index_integrity": index_integrity, "freshness_scope": "as-recorded-at-index-time"}
 
 
 def partition_index(records: list[dict[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -930,7 +962,8 @@ def _warm_scan_snapshot(root: Path, cfg: dict[str, Any], paths: list[Path], core
         freshness = json.loads((index_dir(root) / "cache/freshness.json").read_text(encoding="utf-8")).get("files", {})
     except (OSError, json.JSONDecodeError):
         return None
-    if (meta.get("format") != "CTXPP-INDEX/1" or meta.get("core_version") != core_version
+    if (meta.get("format") != "CTXPP-INDEX/1" or meta.get("root") != str(root)
+            or meta.get("core_version") != core_version
             or meta.get("config_hash") != sha256_bytes(stable_json(cfg).encode())):
         return None
     manifest_files = dict(manifest.get("files", {}))
@@ -1107,6 +1140,7 @@ def scan_repository(root: Path, cfg: dict[str, Any], skill_root: Path, scoped: I
                 candidate_prior = load_index(root)
                 candidate_meta, prior_index_files, _, _ = partition_index(candidate_prior)
                 if (candidate_meta.get("format") == "CTXPP-INDEX/1"
+                        and candidate_meta.get("root") == str(root)
                         and candidate_meta.get("core_version") == core_version):
                     prior_index_records = candidate_prior
                     prior_failure_summaries = list(candidate_meta.get("failures", []))
@@ -1286,6 +1320,11 @@ def scan_repository(root: Path, cfg: dict[str, Any], skill_root: Path, scoped: I
         "record": "meta", "format": "CTXPP-INDEX/1", "tool_version": VERSION, "root": str(root),
         "generated_at": 0, "deterministic": True, "backend": backend, "semantic": backend != "degraded-text-routing",
         "core_version": core_version, "compilation_database": str(compdb_path) if compdb_path else None,
+        "determinants": {"config_hash": sha256_bytes(stable_json(cfg).encode()),
+                         "compiler_hashes": sorted({sha256_bytes(stable_json(command).encode())
+                                                    for item in by_file.values() for command in item}),
+                         "compilation_database_hash": sha256_file(compdb_path) if compdb_path else None,
+                         "core_hash": core_hash},
         "config_hash": sha256_bytes(stable_json(cfg).encode()), "failures": failure_summaries,
         "coverage": {"semantic": len(semantic_symbols), "lexical_only": lexical_count},
         "incomplete": backend == "degraded-text-routing" or bool(failure_summaries) or bool(lexical_count),

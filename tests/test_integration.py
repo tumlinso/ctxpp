@@ -54,6 +54,25 @@ class IntegrationTests(unittest.TestCase):
     def scan(self) -> dict:
         return json.loads(self.ctxpp("scan").stdout)
 
+    def test_external_state_dir_tracks_additions_and_deletions(self) -> None:
+        state = Path(self.temp.name) / "ctxpp-state"
+        command = [str(SCRIPTS / "ctxpp"), "--root", str(self.root), "--state-dir", str(state), "--json", "scan"]
+        first = subprocess.run(command, cwd=self.root, text=True, capture_output=True)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertTrue((state / "index.jsonl").is_file())
+        self.assertFalse((self.root / ".ctxpp").exists())
+        added = self.root / "src/extra.cpp"
+        added.write_text("int added_entry() { return 7; }\n", encoding="utf-8")
+        second = subprocess.run(command, cwd=self.root, text=True, capture_output=True)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        manifest = json.loads((state / "manifest.json").read_text(encoding="utf-8"))
+        self.assertIn("src/extra.cpp", manifest["files"])
+        added.unlink()
+        third = subprocess.run(command, cwd=self.root, text=True, capture_output=True)
+        self.assertEqual(third.returncode, 0, third.stderr)
+        manifest = json.loads((state / "manifest.json").read_text(encoding="utf-8"))
+        self.assertNotIn("src/extra.cpp", manifest["files"])
+
     def test_init_is_agent_owned_idempotent_and_preserves_existing_configuration(self) -> None:
         config = self.root / ".ctxpp.toml"
         config.unlink()

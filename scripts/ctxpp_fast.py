@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ctxpp_rank import rank as _rank, terms as _rank_terms
+from ctxpp_paths import state_dir
 
 
 def _bounded_failures(root: Path, failures: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -14,7 +15,7 @@ def _bounded_failures(root: Path, failures: list[dict[str, Any]]) -> list[dict[s
         return failures
     encoded = "\n".join(json.dumps(item, sort_keys=True, separators=(",", ":")) for item in failures)
     digest = hashlib.sha256(encoded.encode()).hexdigest()[:16]
-    log = root / ".ctxpp/logs" / f"status-{digest}.log"
+    log = state_dir(root) / "logs" / f"status-{digest}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     if not log.is_file():
         temporary = log.with_suffix(".tmp")
@@ -123,7 +124,7 @@ def _parse(argv: list[str]) -> tuple[Path, str, str, int] | None:
 def _freshness(root: Path, counters: dict[str, int], *, check_config: bool = False) -> tuple[set[str], set[str]] | None:
     import hashlib
     try:
-        payload = json.loads((root / ".ctxpp/cache/freshness.json").read_text(encoding="utf-8"))
+        payload = json.loads((state_dir(root) / "cache/freshness.json").read_text(encoding="utf-8"))
         freshness = payload["files"]
         config = root / ".ctxpp.toml"
         if check_config and ((hashlib.sha256(config.read_bytes()).hexdigest() if config.is_file() else None) != payload.get("config_file_hash")):
@@ -146,7 +147,7 @@ def _freshness(root: Path, counters: dict[str, int], *, check_config: bool = Fal
         if git_dirty is not None:
             source_suffixes = {".h", ".hh", ".hpp", ".hxx", ".inc", ".ipp", ".cc", ".cpp", ".cxx", ".cu", ".cuh"}
             dirty.update(rel for rel in git_dirty if rel not in freshness and Path(rel).suffix in source_suffixes)
-        readiness = json.loads((root / ".ctxpp/cache/readiness.json").read_text(encoding="utf-8"))
+        readiness = json.loads((state_dir(root) / "cache/readiness.json").read_text(encoding="utf-8"))
         return dirty, set(readiness.get("semantic_stale_tus", []))
     except (OSError, KeyError, json.JSONDecodeError):
         return None
@@ -188,7 +189,7 @@ def _query_safe(root: Path, connection: sqlite3.Connection, counters: dict[str, 
     degraded_files = {str(symbol.get("file", "")) for symbol in matches if symbol.get("degraded")}
     if degraded_files:
         for name in ("observed-commands.json", "parse-recipes.json"):
-            try: records = json.loads((root / ".ctxpp/cache" / name).read_text(encoding="utf-8")).get("records", [])
+            try: records = json.loads((state_dir(root) / "cache" / name).read_text(encoding="utf-8")).get("records", [])
             except (OSError, json.JSONDecodeError, TypeError): continue
             for record in records:
                 source = Path(str(record.get("file", "")))
@@ -212,7 +213,7 @@ def _query_safe(root: Path, connection: sqlite3.Connection, counters: dict[str, 
     if selected_tus & stale_tus:
         return False
     try:
-        tu_state = json.loads((root / ".ctxpp/cache/tu-state.json").read_text(encoding="utf-8")).get("jobs", {})
+        tu_state = json.loads((state_dir(root) / "cache/tu-state.json").read_text(encoding="utf-8")).get("jobs", {})
     except (OSError, json.JSONDecodeError):
         tu_state = {}
     for key, record in tu_state.items():
@@ -229,7 +230,7 @@ def _decode(rows) -> list[dict[str, Any]]:
 
 def _overlay(root: Path) -> list[dict[str, Any]]:
     try:
-        payload = json.loads((root / ".ctxpp/cache/lexical-overlay.json").read_text(encoding="utf-8"))
+        payload = json.loads((state_dir(root) / "cache/lexical-overlay.json").read_text(encoding="utf-8"))
         return list(payload.get("symbols", [])) if payload.get("format") == "CTXPP-LEXICAL-OVERLAY/1" else []
     except (OSError, json.JSONDecodeError, TypeError):
         return []
@@ -280,8 +281,8 @@ def try_fast(argv: list[str]) -> int | None:
         return None
     import sqlite3
     root, command, query, limit = parsed
-    database = root / ".ctxpp/cache/query.sqlite"
-    manifest_path = root / ".ctxpp/manifest.json"
+    database = state_dir(root) / "cache/query.sqlite"
+    manifest_path = state_dir(root) / "manifest.json"
     try:
         expected = json.loads(manifest_path.read_text(encoding="utf-8"))["index_hash"]
         connection = sqlite3.connect(f"file:{database}?mode=ro&immutable=1", uri=True)

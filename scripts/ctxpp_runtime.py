@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable
 import fcntl
 import functools
+from ctxpp_paths import state_dir
 
 
 QUERY_SCHEMA = 1
@@ -226,8 +227,8 @@ class ResourceScheduler:
         self.initial_worker_cap = 0
         self.peak_workers = 0
         self.backoffs = 0
-        self.path = root / ".ctxpp/cache/scheduler.json"
-        self.history_lock = root / ".ctxpp/cache/scheduler.lock"
+        self.path = state_dir(root) / "cache/scheduler.json"
+        self.history_lock = state_dir(root) / "cache/scheduler.lock"
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             self.history = payload.get("jobs", {}) if payload.get("format") == "CTXPP-SCHEDULER/1" else {}
@@ -235,8 +236,8 @@ class ResourceScheduler:
         except (OSError, json.JSONDecodeError):
             self.history = {}
             self.batches = []
-        self.reservation_path = root / ".ctxpp/cache/resource-reservations.json"
-        self.reservation_lock = root / ".ctxpp/cache/resource-reservations.lock"
+        self.reservation_path = state_dir(root) / "cache/resource-reservations.json"
+        self.reservation_lock = state_dir(root) / "cache/resource-reservations.lock"
 
     @staticmethod
     def _pid_alive(pid: int) -> bool:
@@ -535,13 +536,13 @@ class QueryStore:
 
 
 def query_store_path(root: Path) -> Path:
-    return root / ".ctxpp/cache/query.sqlite"
+    return state_dir(root) / "cache/query.sqlite"
 
 
 def open_query_store(root: Path) -> QueryStore | None:
     import sqlite3
     database = query_store_path(root)
-    manifest = root / ".ctxpp/manifest.json"
+    manifest = state_dir(root) / "manifest.json"
     if not database.is_file() or not manifest.is_file():
         count("query_store_misses")
         return None

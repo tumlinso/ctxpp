@@ -2,10 +2,24 @@
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path, PurePosixPath
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
+
+# Consume the global state-dir option before the fast path handles status.
+_argv = list(sys.argv[1:])
+for _index, _arg in enumerate(_argv):
+    if _arg == "--state-dir" and _index + 1 < len(_argv):
+        os.environ["CTXPP_STATE_DIR"] = str(Path(_argv[_index + 1]).expanduser().resolve())
+        del _argv[_index:_index + 2]
+        break
+    if _arg.startswith("--state-dir="):
+        os.environ["CTXPP_STATE_DIR"] = str(Path(_arg.split("=", 1)[1]).expanduser().resolve())
+        del _argv[_index]
+        break
+sys.argv[1:] = _argv
 
 from ctxpp_fast import try_fast  # noqa: E402
 
@@ -20,8 +34,8 @@ import shutil
 import subprocess
 
 from ctxpp_lib import (  # noqa: E402
-    CtxppError, Tokenizer, apply_plan, atomic_write, audit_repository, ensure_query_fresh, explain_generated, find_compdb, find_core, find_root,
-    index_meta, index_status, lint_repository, load_cached_view, load_config, load_index, partition_index, persist_view, render_bundle,
+    CtxppError, Tokenizer, apply_plan, atomic_write, audit_repository, ensure_query_fresh, explain_generated, find_compdb, find_core, find_root, index_dir,
+    index_meta, index_status, lint_repository, load_cached_view, load_config, load_export, load_index, partition_index, persist_view, render_bundle,
     resolve_symbols, route_symbols, scan_repository, semantic_local_rename_plan, shard_plan, source_text,
     save_cached_view, stable_json, verify_commands, view_cache_lock,
 )
@@ -31,11 +45,14 @@ from ctxpp_packet import build_context_packet, build_task_packet, render_inspect
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ctxpp", description="Deterministic C++ context compiler")
     p.add_argument("--root", type=Path, help="repository root (defaults to nearest .ctxpp.toml)")
+    p.add_argument("--state-dir", type=Path, help="generated state directory (defaults to <root>/.ctxpp)")
     p.add_argument("--json", action="store_true", help="emit stable JSON")
+    p.add_argument("--read-only", action="store_true", help="use the published index only; never refresh or write state")
     sub = p.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init"); init.add_argument("--no-build-core", action="store_true"); init.add_argument("--no-scan", action="store_true")
     sub.add_parser("doctor")
     sub.add_parser("status")
+    sub.add_parser("export", help="read the published index as JSON without refreshing it")
     scan = sub.add_parser("scan"); scan.add_argument("paths", nargs="*")
     where = sub.add_parser("where"); where.add_argument("target"); where.add_argument("--limit", type=int, default=8)
     route = sub.add_parser("route"); route.add_argument("query"); route.add_argument("--limit", type=int, default=8)
@@ -80,7 +97,7 @@ def initialize(root: Path, skill_root: Path, *, build_core: bool, scan: bool) ->
     if not core and build_core:
         build_script = skill_root / "scripts/build_tool.sh"
         proc = subprocess.run([str(build_script)], cwd=skill_root, text=True, capture_output=True, check=False)
-        log_path = root / ".ctxpp/init-core-build.log"
+        log_path = index_dir(root) / "init-core-build.log"
         atomic_write(log_path, (proc.stdout + proc.stderr).encode())
         build = {"attempted": True, "returncode": proc.returncode, "log": str(log_path)}
         core = find_core(skill_root)
@@ -207,21 +224,43 @@ def _task_symbol_authorized(symbol: dict, authorized: list[str]) -> bool:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if argv is not None:
+        argv = list(argv)
+        for index, arg in enumerate(argv):
+            if arg == "--state-dir" and index + 1 < len(argv):
+                os.environ["CTXPP_STATE_DIR"] = str(Path(argv[index + 1]).expanduser().resolve())
+                argv[index:index + 2] = []
+                break
+            if arg.startswith("--state-dir="):
+                os.environ["CTXPP_STATE_DIR"] = str(Path(arg.split("=", 1)[1]).expanduser().resolve())
+                del argv[index]
+                break
     args = parser().parse_args(argv)
+    if args.state_dir:
+        os.environ["CTXPP_STATE_DIR"] = str(args.state_dir.expanduser().resolve())
     root = args.root.resolve() if args.command == "init" and args.root else (find_root(args.root).resolve() if args.root else find_root())
     cfg, configured = load_config(root)
     skill_root = SCRIPT_DIR.parent
+    def prepare_query(query: str) -> None:
+        if args.read_only:
+            load_index(root)
+        else:
+            ensure_query_fresh(root, cfg, skill_root, query)
     try:
+        if args.read_only and args.command not in {"export", "where", "route", "packet", "inspect", "slice", "view", "expand"}:
+            raise CtxppError("--read-only is supported only for retrieval and export commands")
         if args.command == "init":
             result = initialize(root, skill_root, build_core=not args.no_build_core, scan=not args.no_scan)
         elif args.command == "doctor":
             result = doctor(root, cfg, configured, skill_root)
         elif args.command == "status":
             result = {"format": "CTXPP-STATUS/1", "root": str(root), "configured": configured, **index_status(root, cfg)}
+        elif args.command == "export":
+            result = load_export(root, args.state_dir)
         elif args.command == "scan":
             result = {"format": "CTXPP-SCAN/1", **scan_repository(root, cfg, skill_root, args.paths)}
         elif args.command in ("where", "route"):
-            ensure_query_fresh(root, cfg, skill_root, args.target if args.command == "where" else args.query)
+            prepare_query(args.target if args.command == "where" else args.query)
             matches = resolve_symbols(root, args.target, args.limit) if args.command == "where" else route_symbols(root, args.query, args.limit)
             result = {"format": f"CTXPP-{args.command.upper()}/1", "incomplete": not bool(index_meta(root).get("semantic")),
                       "matches": [{k: s.get(k) for k in ("id", "qualified_name", "kind", "file", "line", "definition", "degraded")} for s in matches]}
@@ -242,7 +281,7 @@ def main(argv: list[str] | None = None) -> int:
                     objective = str(spec.get("objective", "")).strip()
                     if not objective:
                         raise CtxppError("task spec requires objective or target symbols")
-                    ensure_query_fresh(root, cfg, skill_root, objective)
+                    prepare_query(objective)
                     routed = route_symbols(root, objective, 32 if strict_authorized else 4)
                     requested = [str(item["id"]) for item in routed
                                  if not strict_authorized or _task_symbol_authorized(item, authorized)][:4]
@@ -251,7 +290,7 @@ def main(argv: list[str] | None = None) -> int:
                 resolved = []
                 seen = set()
                 for query in requested:
-                    ensure_query_fresh(root, cfg, skill_root, query)
+                    prepare_query(query)
                     candidates = resolve_symbols(root, query, 8)
                     if not candidates:
                         raise CtxppError(f"target not found: {query}")
@@ -276,13 +315,14 @@ def main(argv: list[str] | None = None) -> int:
                     root, spec, resolved, consumer=args.consumer, intent=intent,
                     budget=budget, max_items=args.max_items, tokenizer=tokenizer,
                 )
-                tokenizer.flush()
+                if not args.read_only:
+                    tokenizer.flush()
                 result = packet if args.command == "packet" or args.json else render_task_inspect(packet)
                 print_result(result, args.json)
                 return 0
             if not args.target:
                 raise CtxppError("packet target or --task-spec is required")
-            ensure_query_fresh(root, cfg, skill_root, args.target)
+            prepare_query(args.target)
             matches = resolve_symbols(root, args.target, 8)
             if not matches:
                 raise CtxppError(f"target not found: {args.target}")
@@ -296,10 +336,11 @@ def main(argv: list[str] | None = None) -> int:
                 budget = args.budget or int(cfg.get("budgets", {}).get("default_slice_tokens", 2400))
                 packet = build_context_packet(root, args.target, matches[0], intent=args.intent, budget=budget,
                                               max_items=args.max_items, tokenizer=tokenizer)
-                tokenizer.flush()
+                if not args.read_only:
+                    tokenizer.flush()
                 result = packet if args.command == "packet" or args.json else render_inspect(packet)
         elif args.command in ("slice", "view"):
-            ensure_query_fresh(root, cfg, skill_root, args.target)
+            prepare_query(args.target)
             matches = resolve_symbols(root, args.target, 8)
             if not matches: raise CtxppError(f"target not found: {args.target}")
             if len(matches) > 1 and not any(args.target == s.get(k) for s in matches for k in ("id", "qualified_name")):
@@ -310,8 +351,10 @@ def main(argv: list[str] | None = None) -> int:
                 tokenizer = Tokenizer(root, str(cfg.get("tokenizer", "auto")), defer_writes=True)
                 core = find_core(skill_root)
                 tokenizer_cache_identity = tokenizer.cache_identity()
-                cached = load_cached_view(root, target, args.intent, budget, args.layout, tokenizer_cache_identity, core) if args.command == "view" else None
-                if args.command == "view" and not cached:
+                cached = load_cached_view(root, target, args.intent, budget, args.layout, tokenizer_cache_identity, core) if args.command == "view" and not args.read_only else None
+                if args.command == "view" and args.read_only:
+                    text, source_map, report = render_bundle(root, target, args.intent, budget, tokenizer, compact=True, core=core, layout=args.layout)
+                elif args.command == "view" and not cached:
                     with view_cache_lock(root, target, args.intent, budget, args.layout, tokenizer_cache_identity, core):
                         cached = load_cached_view(root, target, args.intent, budget, args.layout, tokenizer_cache_identity, core)
                         if not cached:
@@ -321,8 +364,12 @@ def main(argv: list[str] | None = None) -> int:
                     text, source_map, report = cached
                 elif args.command != "view":
                     text, source_map, report = render_bundle(root, target, args.intent, budget, tokenizer, compact=False, core=core, layout=args.layout)
-                tokenizer.flush()
-                if args.command == "view":
+                if not args.read_only:
+                    tokenizer.flush()
+                if args.command == "view" and args.read_only:
+                    result = {"format": "CTXPP-VIEW/1", "readonly": True, "report": report,
+                              "content": text, "source_map": source_map}
+                elif args.command == "view":
                     view_path, map_path = persist_view(root, text, source_map)
                     result = {"format": "CTXPP-VIEW/1", "readonly": True, "view": str(view_path), "source_map": str(map_path), "report": report, "content": text}
                 else:
@@ -330,7 +377,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "explain":
             result = {"format": "CTXPP-EXPLAIN/1", **explain_generated(root, args.query)}
         elif args.command == "expand":
-            ensure_query_fresh(root, cfg, skill_root, args.target)
+            prepare_query(args.target)
             matches = resolve_symbols(root, args.target, 2)
             if not matches: raise CtxppError(f"target not found: {args.target}")
             result = source_text(root, matches[0])

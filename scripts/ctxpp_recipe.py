@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from ctxpp_paths import state_dir
 from typing import Any, Callable
 
 
@@ -125,7 +126,7 @@ def preflight(recipe: dict[str, Any], source: Path) -> tuple[bool, str]:
 
 
 def observed_records(root: Path) -> list[dict[str, Any]]:
-    path = root / ".ctxpp/cache/observed-commands.json"
+    path = state_dir(root) / "cache/observed-commands.json"
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
         return list(value.get("records", [])) if value.get("format") == "CTXPP-OBSERVED-COMMANDS/1" else []
@@ -134,7 +135,7 @@ def observed_records(root: Path) -> list[dict[str, Any]]:
 
 
 def successful_records(root: Path) -> list[dict[str, Any]]:
-    path = root / ".ctxpp/cache/parse-recipes.json"
+    path = state_dir(root) / "cache/parse-recipes.json"
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, TypeError):
@@ -159,7 +160,7 @@ def persist_successful(root: Path, record: dict[str, Any], source: Path, origin:
     records.append(saved)
     records.sort(key=lambda item: (str(_record_source(item)), json.dumps(item, sort_keys=True, default=str)))
     payload = {"format": "CTXPP-PARSE-RECIPES/1", "records": records}
-    write(root / ".ctxpp/cache/parse-recipes.json", (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode())
+    write(state_dir(root) / "cache/parse-recipes.json", (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode())
 
 
 def capture_direct(root: Path, command: str, cwd: Path, succeeded: bool, write: Callable[[Path, bytes], None]) -> None:
@@ -179,7 +180,7 @@ def capture_direct(root: Path, command: str, cwd: Path, succeeded: bool, write: 
         records.append({"directory": str(cwd), "file": source, "arguments": argv, "origin": "observed_standalone"})
     unique = {json.dumps(record, sort_keys=True, separators=(",", ":")): record for record in records}
     payload = {"format": "CTXPP-OBSERVED-COMMANDS/1", "records": [unique[key] for key in sorted(unique)]}
-    write(root / ".ctxpp/cache/observed-commands.json", (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode())
+    write(state_dir(root) / "cache/observed-commands.json", (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode())
 
 
 def run_captured(root: Path, command: str, cwd: Path, write: Callable[[Path, bytes], None]) -> subprocess.CompletedProcess[str]:
@@ -214,7 +215,7 @@ def run_captured(root: Path, command: str, cwd: Path, write: Callable[[Path, byt
                                         "arguments": captured["arguments"], "origin": "observed_standalone"})
         unique = {json.dumps(record, sort_keys=True, separators=(",", ":")): record for record in records}
         payload = {"format": "CTXPP-OBSERVED-COMMANDS/1", "records": [unique[key] for key in sorted(unique)]}
-        write(root / ".ctxpp/cache/observed-commands.json", (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode())
+        write(state_dir(root) / "cache/observed-commands.json", (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode())
         capture_direct(root, command, cwd, proc.returncode == 0, write)
         return proc
 

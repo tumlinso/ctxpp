@@ -4,6 +4,7 @@ import hashlib
 import sys
 import subprocess
 from pathlib import Path
+from ctxpp_paths import state_dir
 from typing import Any
 
 from ctxpp_lib import (CtxppError, Tokenizer, load_index, partition_index,
@@ -271,7 +272,7 @@ def build_context_packet(root: Path, requested_target: str, target: dict[str, An
             "index_backend": str(meta.get("backend", "unknown")),
             "index_semantic": bool(meta.get("semantic")),
             "index_incomplete": bool(meta.get("incomplete")),
-            "index_sha256": sha256_file(root / ".ctxpp/index.jsonl"),
+            "index_sha256": sha256_file(state_dir(root) / "index.jsonl"),
         },
         "coverage": {
             "sufficient": False,
