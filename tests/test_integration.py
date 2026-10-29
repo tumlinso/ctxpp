@@ -115,6 +115,30 @@ class IntegrationTests(unittest.TestCase):
         overloads = json.loads(self.ctxpp("where", "overloaded").stdout)
         self.assertEqual(len(overloads["matches"]), 2)
 
+    def test_file_symbol_metadata_matches_final_semantic_lexical_and_retained_symbols(self) -> None:
+        lexical = self.root / "include/lexical_only.hpp"
+        lexical.write_text("#pragma once\nstruct LexicalOnlyType { int field; };\n", encoding="utf-8")
+        self.scan()
+
+        source = self.root / "src/plan.cpp"
+        source.write_bytes(source.read_bytes() + b"\n// refresh only this translation unit\n")
+        counters = self.profiled("file-metadata-incremental", "scan")["counters"]
+        self.assertEqual(counters.get("tus_parsed", 0), 1)
+
+        records = load_index(self.root)
+        _, files, symbols, _ = partition_index(records)
+        symbol_ids_by_file = {}
+        for item in symbols:
+            symbol_ids_by_file.setdefault(item.get("file"), []).append(item["id"])
+        for item in files:
+            self.assertEqual(item["symbols"], sorted(symbol_ids_by_file.get(item["path"], [])), item["path"])
+
+        lexical_symbols = [item for item in symbols
+                           if item.get("file") == "include/lexical_only.hpp" and item.get("degraded")]
+        self.assertTrue(lexical_symbols)
+        self.assertTrue(any(item.get("file") == "src/other.cpp" for item in symbols),
+                        "an unchanged TU's retained symbols should remain indexed")
+
     def test_warm_and_incremental_scan_do_not_materialize_unchanged_tu_payloads(self) -> None:
         self.scan()
         warm = self.profiled("warm-scan", "scan")["counters"]

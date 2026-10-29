@@ -970,10 +970,13 @@ def enrich_semantic_edges(root: Path, symbols: list[dict[str, Any]], edges: list
         if target.get("kind") not in ("VarDecl", "FieldDecl") or parent.get("kind") in callable_kinds:
             continue
         rel = edge.get("file", "")
-        try:
-            data = data_cache.setdefault(rel, (root / rel).read_bytes())
-        except OSError:
-            continue
+        data = data_cache.get(rel)
+        if data is None:
+            try:
+                data = (root / rel).read_bytes()
+            except OSError:
+                continue
+            data_cache[rel] = data
         start, end = int(edge.get("start", 0)), int(edge.get("end", 0))
         before = data[max(0, start - 3):start].decode(errors="ignore").rstrip()
         after = data[end:min(len(data), end + 4)].decode(errors="ignore").lstrip()
@@ -982,6 +985,24 @@ def enrich_semantic_edges(root: Path, symbols: list[dict[str, Any]], edges: list
         extras.append({**edge, "type": "nonlocal_write" if write else "nonlocal_read", "via": edge.get("type")})
     merged = {stable_json(e): e for e in [*edges, *extras]}
     return sorted(merged.values(), key=lambda x: (x.get("type", ""), x.get("from", ""), x.get("to", ""), x.get("file", ""), x.get("start", 0)))
+
+
+def _file_metadata_indexes(symbols: list[dict[str, Any]], core_records: list[dict[str, Any]]) -> tuple[dict[str, list[str]], dict[str, set[Any]]]:
+    """Group per-file symbol IDs and include targets for index file records."""
+    symbol_ids_by_file: dict[str, list[str]] = {}
+    for symbol in symbols:
+        rel = symbol.get("file")
+        if isinstance(rel, str) and rel:
+            symbol_ids_by_file.setdefault(rel, []).append(symbol["id"])
+
+    include_targets_by_file: dict[str, set[Any]] = {}
+    for record in core_records:
+        if record.get("record") != "include":
+            continue
+        rel = record.get("from")
+        if isinstance(rel, str) and rel:
+            include_targets_by_file.setdefault(rel, set()).add(record.get("to"))
+    return symbol_ids_by_file, include_targets_by_file
 
 
 def _warm_scan_snapshot(root: Path, cfg: dict[str, Any], paths: list[Path], core_version: str) -> dict[str, Any] | None:
@@ -1288,6 +1309,7 @@ def scan_repository(root: Path, cfg: dict[str, Any], skill_root: Path, scoped: I
     symbols.extend(lexical_symbols(root, paths, symbols))
     symbols.sort(key=lambda x: (x.get("qualified_name", ""), x.get("file", ""), x.get("start", 0), x["id"]))
     edges = enrich_semantic_edges(root, symbols, edges)
+    symbol_ids_by_file, include_targets_by_file = _file_metadata_indexes(symbols, raw_core)
     for obs in observations:
         for diagnostic in obs.get("diagnostics", []):
             if "error:" in diagnostic.lower():
@@ -1327,7 +1349,7 @@ def scan_repository(root: Path, cfg: dict[str, Any], skill_root: Path, scoped: I
         prior_tus = {str(tu) for tu in prior_file.get("translation_units", [])}
         diagnostics = ([] if prior_tus & incremental_pending_tus else list(prior_file.get("diagnostics", [])))
         diagnostics.extend(d for tu in translation_units for d in observations_by_tu.get(tu, {}).get("diagnostics", []))
-        new_includes = {e.get("to") for e in raw_core if e.get("record") == "include" and e.get("from") == rel}
+        new_includes = set(include_targets_by_file.get(rel, set()))
         includes = new_includes if rel in incremental_pending_tus else set(prior_file.get("includes", [])) | new_includes
         status = "unobserved" if not facts else ("error" if any("error:" in d.lower() for d in diagnostics) else "ok")
         files.append({
@@ -1338,7 +1360,7 @@ def scan_repository(root: Path, cfg: dict[str, Any], skill_root: Path, scoped: I
             "bytes": len(data), "lines": line_count(data), "classification": classify_file(rel),
             "translation_units": translation_units,
             "parse_status": status, "diagnostics": diagnostics,
-            "symbols": sorted(s["id"] for s in symbols if s.get("file") == rel),
+            "symbols": sorted(symbol_ids_by_file.get(rel, [])),
             "includes": sorted(include for include in includes if include),
             "route": None,
         })

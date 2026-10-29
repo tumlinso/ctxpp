@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import random
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from ctxpp_lib import _merge_core_records
+from ctxpp_lib import _file_metadata_indexes, _merge_core_records, enrich_semantic_edges
 
 
 SOURCE = "src/model.cc"
@@ -133,6 +135,68 @@ class SemanticGraphReconstructionTests(unittest.TestCase):
 
         _, actual, _ = _merge_core_records(records)
         self.assertEqual(actual, expected)
+
+    def test_per_file_metadata_indexes_match_linear_reference_with_prior_and_new_records(self) -> None:
+        symbols = [
+            symbol("a_symbol", "FunctionDecl", 0, 10, file="src/a.cc"),
+            symbol("a_symbol", "FunctionDecl", 0, 10, file="src/a.cc"),
+            symbol("b_symbol", "VarDecl", 0, 1, file="src/b.cc"),
+            {"record": "symbol", "id": "missing-file", "kind": "VarDecl"},
+        ]
+        core_records = [
+            {"record": "include", "from": "src/a.cc", "to": "include/shared.hh"},
+            {"record": "include", "from": "src/a.cc", "to": "include/shared.hh"},
+            {"record": "include", "from": "src/a.cc", "to": ""},
+            {"record": "include", "from": "src/a.cc"},
+            {"record": "include", "from": "src/b.cc", "to": "include/other.hh"},
+            {"record": "include", "to": "include/missing-owner.hh"},
+            {"record": "symbol", "from": "src/a.cc", "to": "include/not-an-include.hh"},
+        ]
+        symbol_ids_by_file, include_targets_by_file = _file_metadata_indexes(symbols, core_records)
+
+        prior_includes = {"src/a.cc": {"include/prior.hh"}, "src/b.cc": {"include/stable.hh"}}
+        incremental_pending_tus = {"src/a.cc"}
+        for rel in ("src/a.cc", "src/b.cc"):
+            expected_ids = sorted(item["id"] for item in symbols if item.get("file") == rel)
+            self.assertEqual(sorted(symbol_ids_by_file.get(rel, [])), expected_ids)
+
+            expected_new = {item.get("to") for item in core_records
+                            if item.get("record") == "include" and item.get("from") == rel}
+            actual_new = set(include_targets_by_file.get(rel, set()))
+            self.assertEqual(actual_new, expected_new)
+            expected_includes = (expected_new if rel in incremental_pending_tus
+                                 else prior_includes.get(rel, set()) | expected_new)
+            actual_includes = (actual_new if rel in incremental_pending_tus
+                               else prior_includes.get(rel, set()) | actual_new)
+            self.assertEqual(actual_includes, expected_includes)
+            self.assertEqual(sorted(item for item in actual_includes if item),
+                             sorted(item for item in expected_includes if item))
+
+    def test_enrichment_reads_each_source_file_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / SOURCE
+            source.parent.mkdir(parents=True)
+            source.write_text("void f() { shared; shared; }\n")
+            symbols = [
+                symbol("function", "FunctionDecl", 0, 40),
+                symbol("shared", "VarDecl", 10, 16),
+            ]
+            edges = [
+                {"type": "reference", "from": "function", "to": "shared", "file": SOURCE, "start": 18, "end": 24},
+                {"type": "member_access", "from": "function", "to": "shared", "file": SOURCE, "start": 25, "end": 31},
+            ]
+            original_read_bytes = Path.read_bytes
+            reads = []
+
+            def record_read(path: Path) -> bytes:
+                reads.append(path)
+                return original_read_bytes(path)
+
+            with patch.object(Path, "read_bytes", autospec=True, side_effect=record_read):
+                enrich_semantic_edges(root, symbols, edges)
+
+            self.assertEqual(reads, [source])
 
     def test_edges_remain_deterministically_sorted(self) -> None:
         records = [
