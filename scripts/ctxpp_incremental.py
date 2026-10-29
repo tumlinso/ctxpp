@@ -64,7 +64,10 @@ def scan_incremental(root: Path, cfg: dict[str, Any], skill_root: Path,
     core = lib.find_core(skill_root)
     if core is None:
         store.close()
-        raise lib.CtxppError("semantic core unavailable for localized scan")
+        raise lib.CtxppError(
+            "native parser unavailable for localized scan; existing semantic index is unchanged. "
+            "Run ctxpp init or scripts/build_tool.sh to restore it, then retry."
+        )
     core_hash = lib.sha256_file(core)
     determinants = old_meta.get("determinants", {})
     if determinants.get("core_hash") and determinants["core_hash"] != core_hash:

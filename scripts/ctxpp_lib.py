@@ -935,6 +935,22 @@ def index_meta(root: Path) -> dict[str, Any]:
         raise CtxppError(f"invalid index record at line 1: {exc}") from exc
 
 
+def _published_index_is_semantic(root: Path) -> bool:
+    # Read only embedded metadata or the first v1 JSONL record.
+    state = index_dir(root)
+    if not (state / "index.sqlite").is_file() and not (state / "index.jsonl").is_file():
+        return False
+    meta = index_meta(root)
+    coverage = meta.get("coverage", {})
+    try:
+        semantic_count = int(coverage.get("semantic", 0)) if isinstance(coverage, dict) else 0
+    except (TypeError, ValueError):
+        semantic_count = 0
+    backend = meta.get("backend")
+    return (bool(meta.get("semantic")) or semantic_count > 0
+            or (isinstance(backend, str) and bool(backend) and backend != "degraded-text-routing"))
+
+
 def _merge_core_records(core_records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     symbol_map: dict[str, dict[str, Any]] = {}
     edge_map: dict[str, dict[str, Any]] = {}
@@ -1196,6 +1212,13 @@ def scan_repository(root: Path, cfg: dict[str, Any], skill_root: Path, scoped: I
             atomic_write(doctor_cache_path, (stable_json({"format": "CTXPP-CORE-CACHE/1", "path": str(core),
                                                          "size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
                                                          "hash": core_hash, "ok": core_ok, "version": core_version}) + "\n").encode())
+
+    if not core_ok and _published_index_is_semantic(root):
+        raise CtxppError(
+            "native parser unavailable; refusing to replace the existing semantic index with "
+            "degraded lexical routing. Run ctxpp init or scripts/build_tool.sh to restore "
+            "the native parser, then retry."
+        )
 
     raw_core: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []

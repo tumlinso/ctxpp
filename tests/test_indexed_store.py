@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -12,7 +13,9 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import ctxpp_store as storage
-from ctxpp_lib import bounded_graph, refresh_lexical_overlay, resolve_symbols
+import ctxpp_lib
+from ctxpp_lib import (CtxppError, bounded_graph, default_config, refresh_lexical_overlay,
+                       resolve_symbols, scan_repository)
 
 
 class IndexedStoreTests(unittest.TestCase):
@@ -121,6 +124,79 @@ class IndexedStoreTests(unittest.TestCase):
         self.assertEqual(resolved[0]['kind'], 'StructDecl')
         self.assertEqual([item['kind'] for item in fallback], ['LexicalFile'])
         self.assertEqual(fallback[0]['file'], 'include/pkg/orphan.hh')
+
+    def test_missing_parser_preserves_existing_semantic_generation(self):
+        source = self.root / 'src/a.cpp'
+        source.parent.mkdir(parents=True)
+        source.write_text('int semantic_entry() { return 1; }\n', encoding='utf-8')
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        records = [
+            {'record': 'meta', 'format': 'CTXPP-INDEX/1', 'root': str(self.root),
+             'semantic': True, 'backend': 'libclang-runtime', 'coverage': {'semantic': 1}},
+            {'record': 'file', 'path': 'src/a.cpp', 'hash': digest, 'commands': []},
+            {'record': 'symbol', 'id': 'semantic-entry', 'name': 'semantic_entry',
+             'qualified_name': 'semantic_entry', 'kind': 'FunctionDecl', 'file': 'src/a.cpp',
+             'definition': True},
+        ]
+        state = self.root / '.ctxpp'
+        generation = storage.publish(self.root, records, {'files': {'src/a.cpp': digest}},
+                                     {'files': {'src/a.cpp': {'hash': digest}}}, state_path=state)
+        names = ('index.sqlite', 'export.json', 'manifest.json', 'cache/freshness.json')
+        paths_before = {name: (state / name).read_bytes() for name in names}
+
+        with mock.patch.dict(os.environ, {'CTXPP_STATE_DIR': str(state)}), mock.patch.object(
+                ctxpp_lib, 'find_core', return_value=None):
+            with self.assertRaisesRegex(CtxppError, 'refusing to replace the existing semantic index'):
+                scan_repository(self.root, default_config(), self.root)
+
+        self.assertEqual(storage.export_descriptor(self.root, state)['generation'], generation)
+        self.assertEqual({name: (state / name).read_bytes() for name in names}, paths_before)
+        store = storage.open_store(self.root, state)
+        try:
+            self.assertTrue(store.meta()['semantic'])
+            self.assertEqual(store.counts(), (1, 1, 0))
+        finally:
+            store.close()
+
+    def test_missing_parser_checks_legacy_v1_metadata_without_loading_graph(self):
+        state = self.root / '.ctxpp'
+        state.mkdir()
+        index = state / 'index.jsonl'
+        meta = {'record': 'meta', 'format': 'CTXPP-INDEX/1', 'root': str(self.root),
+                'semantic': True, 'backend': 'libclang-runtime'}
+        index.write_text(json.dumps(meta) + '\n' + ''.join('{"record":"symbol"}\n' for _ in range(5000)),
+                         encoding='utf-8')
+        before = index.read_bytes()
+        source = self.root / 'src/a.cpp'
+        source.parent.mkdir()
+        source.write_text('int entry() {}\n', encoding='utf-8')
+
+        with mock.patch.dict(os.environ, {'CTXPP_STATE_DIR': str(state)}), mock.patch.object(
+                ctxpp_lib, 'find_core', return_value=None), mock.patch.object(
+                ctxpp_lib, 'load_index', side_effect=AssertionError('full graph load')):
+            with self.assertRaisesRegex(CtxppError, 'refusing to replace the existing semantic index'):
+                scan_repository(self.root, default_config(), self.root)
+
+        self.assertEqual(index.read_bytes(), before)
+        self.assertFalse((state / 'index.sqlite').exists())
+
+    def test_missing_parser_can_create_initial_lexical_index(self):
+        source = self.root / 'src/a.cpp'
+        source.parent.mkdir(parents=True)
+        source.write_text('int lexical_entry() { return 1; }\n', encoding='utf-8')
+        state = self.root / '.ctxpp'
+
+        with mock.patch.dict(os.environ, {'CTXPP_STATE_DIR': str(state)}), mock.patch.object(
+                ctxpp_lib, 'find_core', return_value=None):
+            result = scan_repository(self.root, default_config(), self.root)
+
+        self.assertEqual(result['backend'], 'degraded-text-routing')
+        store = storage.open_store(self.root, state)
+        try:
+            self.assertFalse(store.meta()['semantic'])
+            self.assertGreater(store.counts()[1], 0)
+        finally:
+            store.close()
 
     def test_store_corruption_is_reported(self):
         self.publish()
