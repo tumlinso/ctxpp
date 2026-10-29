@@ -1,0 +1,10 @@
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.ctxpp/
+.state/
+.qualification/
+build/
+dist/
+tool/build/
+tool/build-release/

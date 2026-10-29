@@ -16,7 +16,9 @@ SCRIPTS = SKILL / "scripts"
 FIXTURE = SKILL / "tests/fixtures/sample"
 sys.path.insert(0, str(SCRIPTS))
 
-from ctxpp_lib import Tokenizer, load_index, partition_index, source_text
+from ctxpp_lib import (Tokenizer, _read_tu_cache, _tu_cache_path, _write_tu_cache, load_config,
+                       native_build_directory,
+                       load_index, partition_index, scan_repository, source_text, stable_json)
 
 
 class IntegrationTests(unittest.TestCase):
@@ -59,7 +61,8 @@ class IntegrationTests(unittest.TestCase):
         command = [str(SCRIPTS / "ctxpp"), "--root", str(self.root), "--state-dir", str(state), "--json", "scan"]
         first = subprocess.run(command, cwd=self.root, text=True, capture_output=True)
         self.assertEqual(first.returncode, 0, first.stderr)
-        self.assertTrue((state / "index.jsonl").is_file())
+        self.assertTrue((state / "index.sqlite").is_file())
+        self.assertFalse((state / "index.jsonl").exists())
         self.assertFalse((self.root / ".ctxpp").exists())
         added = self.root / "src/extra.cpp"
         added.write_text("int added_entry() { return 7; }\n", encoding="utf-8")
@@ -83,12 +86,12 @@ class IntegrationTests(unittest.TestCase):
         self.assertTrue(initialized["ready"]["semantic_routing"])
         self.assertEqual(initialized["scan"]["backend"], "libclang-runtime")
         baseline_config = config.read_bytes()
-        baseline_index = (self.root / ".ctxpp/index.jsonl").read_bytes()
+        baseline_index = (self.root / ".ctxpp/export.json").read_bytes()
 
         repeated = json.loads(self.ctxpp("init").stdout)
         self.assertTrue(repeated["configuration"]["preserved"])
         self.assertEqual(config.read_bytes(), baseline_config)
-        self.assertEqual((self.root / ".ctxpp/index.jsonl").read_bytes(), baseline_index)
+        self.assertEqual((self.root / ".ctxpp/export.json").read_bytes(), baseline_index)
 
     def test_init_reports_agent_action_instead_of_claiming_semantic_readiness_without_compdb(self) -> None:
         (self.root / ".ctxpp.toml").unlink()
@@ -102,9 +105,16 @@ class IntegrationTests(unittest.TestCase):
 
     def test_scan_where_overloads_and_determinism(self) -> None:
         first = self.scan()
-        index_first = (self.root / ".ctxpp/index.jsonl").read_bytes()
+        records_first = [stable_json(record) for record in load_index(self.root)]
         second = self.scan()
-        self.assertEqual(index_first, (self.root / ".ctxpp/index.jsonl").read_bytes())
+        self.assertEqual(records_first, [stable_json(record) for record in load_index(self.root)])
+        self.assertFalse((self.root / ".ctxpp/index.jsonl").exists())
+        tu_cache = self.root / ".ctxpp/cache/tu"
+        compressed = list(tu_cache.glob("*.jsonl.z"))
+        self.assertTrue(compressed)
+        self.assertFalse(list(tu_cache.glob("*.jsonl")))
+        self.assertIn(json.loads(_read_tu_cache(compressed[0]).splitlines()[0]).get("record"),
+                      {"observation", "symbol", "edge", "include"})
         self.assertEqual(first["backend"], "libclang-runtime")
         self.assertGreater(first["symbols"], 20)
         self.assertEqual({k: v for k, v in first.items() if k != "cache_hits"},
@@ -114,6 +124,21 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(found["matches"][0]["file"], "src/plan.cpp")
         overloads = json.loads(self.ctxpp("where", "overloaded").stdout)
         self.assertEqual(len(overloads["matches"]), 2)
+
+    def test_tu_cache_content_addressing_preserves_prior_generation(self) -> None:
+        cache_dir = self.root / ".ctxpp/cache/tu"
+        first_payload = b'{"record":"symbol","id":"old"}\n'
+        second_payload = b'{"record":"symbol","id":"new"}\n'
+        key = "a" * 64
+        first = _tu_cache_path(cache_dir, key, first_payload)
+        _write_tu_cache(first, first_payload)
+        committed_bytes = first.read_bytes()
+        second = _tu_cache_path(cache_dir, key, second_payload)
+        _write_tu_cache(second, second_payload)
+        self.assertNotEqual(first, second)
+        self.assertEqual(first.read_bytes(), committed_bytes)
+        self.assertEqual(_read_tu_cache(first), first_payload.decode())
+        self.assertEqual(_read_tu_cache(second), second_payload.decode())
 
     def test_file_symbol_metadata_matches_final_semantic_lexical_and_retained_symbols(self) -> None:
         lexical = self.root / "include/lexical_only.hpp"
@@ -243,7 +268,7 @@ class IntegrationTests(unittest.TestCase):
     def test_private_query_cache_is_disposable_and_command_changes_are_local(self) -> None:
         self.scan()
         expected = self.ctxpp("where", "demo::PackingPlan::freeze").stdout
-        (self.root / ".ctxpp/cache/query.sqlite").unlink()
+        (self.root / ".ctxpp/cache/query.sqlite").unlink(missing_ok=True)
         self.assertEqual(self.ctxpp("where", "demo::PackingPlan::freeze").stdout, expected)
         self.scan()
 
@@ -258,6 +283,40 @@ class IntegrationTests(unittest.TestCase):
         profile = self.profiled("command-change", "scan")["counters"]
         self.assertEqual(profile.get("tus_parsed", 0), 1)
 
+    def test_localized_delta_matches_full_reconstruction(self) -> None:
+        self.scan()
+        source = self.root / "src/plan.cpp"
+        source.write_bytes(b"// shift canonical ranges\n" + source.read_bytes())
+        cfg, _ = load_config(self.root)
+        delta = scan_repository(self.root, cfg, SKILL, refresh_tus={"src/plan.cpp"})
+        self.assertEqual(delta["files"], 4)
+        after_delta = sorted(stable_json(record) for record in load_index(self.root))
+
+        # Removing only this test fixture's generated SQLite file forces a
+        # compatibility reconstruction from the validated TU cache payloads.
+        (self.root / ".ctxpp/index.sqlite").unlink()
+        rebuilt = scan_repository(self.root, cfg, SKILL)
+        self.assertEqual(rebuilt["files"], 4)
+        after_rebuild = sorted(stable_json(record) for record in load_index(self.root))
+        self.assertEqual(after_delta, after_rebuild)
+
+    def test_localized_tu_deletion_matches_full_reconstruction(self) -> None:
+        self.scan()
+        compdb = self.root / "build/compile_commands.json"
+        commands = json.loads(compdb.read_text(encoding="utf-8"))
+        commands = [item for item in commands if Path(item["file"]).resolve() != (self.root / "src/plan.cpp").resolve()]
+        compdb.write_text(json.dumps(commands, separators=(",", ":")) + "\n", encoding="utf-8")
+        (self.root / "src/plan.cpp").unlink()
+        cfg, _ = load_config(self.root)
+        delta = scan_repository(self.root, cfg, SKILL, refresh_tus={"src/plan.cpp"})
+        self.assertEqual(delta["files"], 3)
+        after_delta = sorted(stable_json(record) for record in load_index(self.root))
+
+        (self.root / ".ctxpp/index.sqlite").unlink()
+        rebuilt = scan_repository(self.root, cfg, SKILL)
+        self.assertEqual(rebuilt["files"], 3)
+        self.assertEqual(after_delta, sorted(stable_json(record) for record in load_index(self.root)))
+
     def test_concurrent_scans_publish_only_complete_generations(self) -> None:
         self.scan()
         plan = self.root / "src/plan.cpp"
@@ -271,13 +330,15 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second_err)
         json.loads(first_out)
         json.loads(second_out)
-        for line in (self.root / ".ctxpp/index.jsonl").read_text().splitlines():
-            json.loads(line)
+        reconstructed = load_index(self.root)
+        self.assertTrue(reconstructed)
+        self.assertTrue((self.root / ".ctxpp/index.sqlite").is_file())
         found = json.loads(self.ctxpp("where", "demo::PackingPlan::freeze").stdout)
         self.assertEqual(found["matches"][0]["file"], "src/plan.cpp")
 
     def test_stale_parse_result_cannot_replace_newer_source_generation(self) -> None:
-        real = SKILL / "tool/build/ctxpp-core"
+        real = native_build_directory(SKILL) / "ctxpp-core"
+        self.assertTrue(real.is_file(), real)
         wrapper = self.root / "slow-core.py"
         log = self.root / "slow-core.log"
         wrapper.write_text(
@@ -292,7 +353,7 @@ class IntegrationTests(unittest.TestCase):
         env = {**os.environ, "CTXPP_CORE": str(wrapper)}
         command = [str(SCRIPTS / "ctxpp"), "--root", str(self.root), "--json", "scan"]
         self.assertEqual(subprocess.run(command, cwd=self.root, env=env, capture_output=True).returncode, 0)
-        baseline_index = (self.root / ".ctxpp/index.jsonl").read_bytes()
+        baseline_generation = (self.root / ".ctxpp/export.json").read_bytes()
         log.unlink(missing_ok=True)
         source = self.root / "src/plan.cpp"
         source.write_bytes(source.read_bytes() + b"\n")
@@ -304,7 +365,7 @@ class IntegrationTests(unittest.TestCase):
         source.write_bytes(source.read_bytes() + b"// newer generation\n")
         _, stderr = running.communicate()
         self.assertNotEqual(running.returncode, 0, stderr.decode())
-        self.assertEqual((self.root / ".ctxpp/index.jsonl").read_bytes(), baseline_index)
+        self.assertEqual((self.root / ".ctxpp/export.json").read_bytes(), baseline_generation)
 
     def test_edit_slice_is_verbatim_whole_and_budget_reports_omissions(self) -> None:
         self.scan()
@@ -313,7 +374,9 @@ class IntegrationTests(unittest.TestCase):
         target = next(s for s in symbols if s.get("qualified_name") == "demo::PackingPlan::freeze" and s.get("definition"))
         canonical = source_text(self.root, target)
         bundle = json.loads(self.ctxpp("slice", target["id"], "--intent", "edit", "--budget", "90").stdout)
-        self.assertIn(canonical, bundle["content"])
+        self.assertNotIn(canonical, bundle["content"])
+        self.assertIn("target exceeds budget", bundle["content"])
+        self.assertFalse(bundle["report"]["sufficient"])
         self.assertIn("sufficient=", bundle["content"])
         self.assertTrue(canonical.rstrip().endswith("}"))
         self.assertNotIn("//@generated", (self.root / "src/plan.cpp").read_text())

@@ -95,6 +95,8 @@ def _parse(argv: list[str]) -> tuple[Path, str, str, int] | None:
             root = Path(argv[position + 1]); position += 2
         elif argv[position] == "--json":
             position += 1
+        elif argv[position] == "--read-only":
+            position += 1
         else:
             return None
     if position >= len(argv) or argv[position] not in ("status", "where", "route"):
@@ -281,6 +283,9 @@ def try_fast(argv: list[str]) -> int | None:
         return None
     import sqlite3
     root, command, query, limit = parsed
+    # Canonical v2 reads use the shared bounded store; never query an obsolete v1 cache.
+    if (state_dir(root) / "index.sqlite").is_file():
+        return None
     database = state_dir(root) / "cache/query.sqlite"
     manifest_path = state_dir(root) / "manifest.json"
     try:

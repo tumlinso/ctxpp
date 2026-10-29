@@ -5,31 +5,19 @@ description: Minimize Codex context for C++ by indexing symbols, generating budg
 
 # C++ Context Compiler
 
-## Native skill access
+## Use ctxpp
 
-Native coder, mutator and scout agents read installed `SKILL.md` and its
-references through filesystem/command access. Follow the skill's own routes;
-indexes and graphs accelerate navigation without becoming routing authority.
-No observer skill adapter or mandatory overview is needed for native use.
-Record materially applied guidance during the existing context/handoff flow,
-with skill hash and route relevance; a read alone remains merely consulted.
-See [native routing and handoff](../integrations/native-skill-routing.md).
-
-## Repository workflow
-
-For substantial repository work, use the `project-control` Codex profile.
-Invoke this skill only for the bounded source operation and scope authorized by
-Project Control, when the user explicitly requests ctxpp maintenance, or while
-Project Control itself is being debugged. A fallback authorization states the
-permitted operation, scope, reason, and read/write mode; it never carries a todo
-token.
+Use ctxpp when a repository has `.ctxpp.toml` or the user asks for C++ symbol
+navigation, dependency tracing, bounded source context, or ctxpp maintenance.
+It complements the repository's chosen workflow host; it does not replace that
+host's task or lifecycle instructions.
 
 Canonical C++ is authoritative. `.ctxpp/` bundles (or artifacts in `--state-dir`) are generated retrieval artifacts; map edits back to canonical ranges. Use `--read-only` with retrieval commands or `export` when the published index must not refresh or write caches.
 
 ## Route one mode
 
 - Retrieve: `status`; `where`/`route`; `slice --intent ...`. Read [retrieval](references/retrieval.md).
-- Task/CUDA route: use `packet --task-spec ... --consumer <name>` so accepted paths, task/campaign identity, canonical targets, and bounded performance context stay together.
+- Task/CUDA route: use `packet --task-spec ... --consumer <name>` when the host supplies an authorized task specification; it carries selected paths, target identity, and bounded performance context together.
 - Author: retrieve, edit canonical source, test, rescan/lint. Read [authoring](references/authoring.md); add [topology](references/topology.md) only for boundaries/shards.
 - Audit: `audit`, no mutation. Read [objective](references/objective.md).
 - Compact view: `view`; edit targets stay verbatim. Read [compact views](references/compact-views.md).
@@ -41,9 +29,9 @@ Read [comment contracts](references/comment-contracts.md) only for comment chang
 
 ## Open
 
-1. On explicit use, run `scripts/ctxpp --root ROOT init`. The agent owns initialization: config, core build, compilation-database discovery/generation, and safe verification-command inference. Preserve existing config. Ask only for a real package/authority blocker.
-2. Run `doctor` and `status`, then narrow with `where`/`route` and an intent slice. Retrieval refreshes relevant stale TUs lazily; do not preemptively full-scan. Before mutation, require a fresh full semantic scan.
-3. Open canonical source only for the edit range. Test changes; refresh index/routes afterward.
+1. On explicit use, run `ctxpp --root ROOT init`. Initialization preserves an existing `.ctxpp.toml`, builds the optional parser when needed, discovers the compilation database, and scans. It does not install packages or guess unknown build commands.
+2. Check `status`, then use `where`/`route`, `inspect`, `packet`, or an intent slice to narrow the relevant source. Retrieval refreshes only relevant stale translation units; an ordinary edit does not need a whole-repository rescan.
+3. Read the canonical source range before editing. Test the change, then use status or targeted retrieval to confirm freshness. Explicit source-rewrite plans require current semantic evidence for affected files.
 
 Initialization is idempotent: never install packages or blindly configure an unknown project. In opted-in repositories, ordinary C++ work uses retrieval/authoring only. Never compact unrelated source; do not activate implicitly for routine C++ work in unconfigured repositories.
 

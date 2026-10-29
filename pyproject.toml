@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ctxpp"
+version = "0.2.0"
+description = "Indexed, source-mapped context for C and C++ repositories"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.scripts]
+ctxpp = "ctxpp_distribution.launcher:main"
+
+[tool.setuptools]
+packages = ["ctxpp_distribution"]
+package-dir = {"ctxpp_distribution" = "package/ctxpp_distribution"}
+
+[tool.setuptools.data-files]
+"share/ctxpp/scripts" = ["scripts/ctxpp", "scripts/ctxpp*.py", "scripts/build_tool.sh"]
+"share/ctxpp/assets" = ["assets/default.ctxpp.toml", "assets/contract-notation.ctx", "assets/example-route.ctx"]
+"share/ctxpp/tool" = ["tool/CMakeLists.txt"]
+"share/ctxpp/tool/include/ctxpp" = ["tool/include/ctxpp/*.hpp"]
+"share/ctxpp/tool/src" = ["tool/src/*.cpp"]
+"share/ctxpp/skills/cpp-context-compiler" = ["skills/cpp-context-compiler/SKILL.md"]
+"share/ctxpp/skills/cpp-context-compiler/agents" = ["skills/cpp-context-compiler/agents/openai.yaml"]
+"share/ctxpp/skills/cpp-context-compiler/references" = ["skills/cpp-context-compiler/references/*.md"]
+"share/ctxpp/skills/cpp-context-compiler/assets" = ["skills/cpp-context-compiler/assets/*"]

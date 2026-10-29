@@ -86,7 +86,10 @@ class ContextPacketTests(unittest.TestCase):
                                          "--max-items", "1").stdout)
         self.assertTrue(mandatory["coverage"]["budget_exceeded"])
         self.assertFalse(mandatory["coverage"]["sufficient"])
-        self.assertIn("PackingPlan::freeze", mandatory["target"]["content"])
+        self.assertEqual(mandatory["target"]["content"], "")
+        self.assertFalse(mandatory["coverage"]["target_complete"])
+        self.assertIn("target", mandatory["coverage"]["omitted"])
+        self.assertTrue(mandatory["target"]["location"]["byte_end"] > mandatory["target"]["location"]["byte_start"])
 
     def test_packet_reports_types_dependencies_tests_and_contract_invariants(self) -> None:
         packet = self.packet()
@@ -112,13 +115,17 @@ class ContextPacketTests(unittest.TestCase):
         self.assertEqual(after["trust"]["target_range"], "hash-verified")
 
     def test_inspect_is_human_first_and_json_uses_the_packet_contract(self) -> None:
-        human = self.ctxpp("inspect", "demo::PackingPlan::freeze", "--max-items", "5", json_output=False).stdout
+        human = self.ctxpp("inspect", "demo::PackingPlan::freeze", "--max-items", "5", "--budget", "2500",
+                           json_output=False).stdout
         self.assertIn("demo::PackingPlan::freeze", human)
-        self.assertIn("edit src/plan.cpp:", human)
-        self.assertIn("source=canonical", human)
-        self.assertIn("expand: ctxpp expand", human)
+        self.assertIn("target (canonical source verified; complete range; src/plan.cpp:", human)
+        self.assertIn("return frozen_score_;", human)
+        self.assertNotIn("sha256=", human)
+        self.assertIn("next bounded context: ctxpp packet", human)
         machine = json.loads(self.ctxpp("inspect", "demo::PackingPlan::freeze", "--max-items", "5").stdout)
         self.assertEqual(machine["format"], "CTXPP-CONTEXT-PACKET/1")
+        self.assertIn("text_sha256", machine["target"])
+        self.assertIn("content_sha256", machine["target"]["location"])
 
     def test_ambiguous_target_returns_candidates_not_a_guessed_packet(self) -> None:
         ambiguous = json.loads(self.ctxpp("packet", "overloaded").stdout)

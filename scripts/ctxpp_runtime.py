@@ -540,6 +540,11 @@ def query_store_path(root: Path) -> Path:
 
 
 def open_query_store(root: Path) -> QueryStore | None:
+    from ctxpp_store import open_store
+    indexed = open_store(root)
+    if indexed is not None:
+        count("query_store_hits")
+        return indexed
     import sqlite3
     database = query_store_path(root)
     manifest = state_dir(root) / "manifest.json"
