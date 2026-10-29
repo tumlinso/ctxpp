@@ -330,7 +330,7 @@ def try_fast(argv: list[str]) -> int | None:
                   "profile": meta.get("_profile"), "source_write_configured": source_write,
                   "source_write_safe": source_write and bool(meta.get("semantic")) and not meta.get("failures")}
     else:
-        output = {"format": f"CTXPP-{command.upper()}/1", "incomplete": not bool(meta.get("semantic")),
+        output = {"format": f"CTXPP-{command.upper()}/1", "incomplete": bool(meta.get("incomplete")) or not bool(meta.get("semantic")),
                   "matches": [{key: symbol.get(key) for key in ("id", "qualified_name", "kind", "file", "line", "definition", "degraded")}
                               for symbol in matches]}
     print(json.dumps(output, ensure_ascii=False, sort_keys=True, separators=(",", ":")))

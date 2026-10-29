@@ -76,6 +76,26 @@ class GlobalOptionTests(unittest.TestCase):
         self.assertEqual(route.returncode, 0, route.stderr)
         self.assertTrue(json.loads(route.stdout)["matches"])
 
+    def test_navigation_reports_partial_semantic_coverage(self) -> None:
+        store = ctxpp_store.open_store(self.root, self.state)
+        try:
+            records = list(store.iter_records())
+        finally:
+            store.close()
+        manifest = json.loads((self.state / "manifest.json").read_text())
+        freshness = json.loads((self.state / "cache/freshness.json").read_text())
+        for incomplete in (False, True):
+            with self.subTest(incomplete=incomplete):
+                records[0]["incomplete"] = incomplete
+                ctxpp_store.publish(self.root, records, manifest, freshness, state_path=self.state)
+                for command in ("where", "route"):
+                    result = self.cli(command, "alpha", "--json", "--read-only",
+                                      "--root", str(self.root), "--state-dir", str(self.state))
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    payload = json.loads(result.stdout)
+                    self.assertTrue(payload["matches"])
+                    self.assertIs(payload["incomplete"], incomplete)
+
     def test_route_accepts_quoted_and_split_multiword_queries(self) -> None:
         common = ("--root", str(self.root), "--state-dir", str(self.state), "--read-only", "--json")
         split = self.cli("route", "alpha", "implementation", "details", "--limit", "1", *common)

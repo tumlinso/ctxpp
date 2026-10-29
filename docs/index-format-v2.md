@@ -129,6 +129,16 @@ Ordinary localized refreshes merge new TU results with indexed surviving symbol
 contributions and update affected file metadata and TU-owned edges. Changes to
 preferred callable locations also reattribute and re-enrich surviving edges in
 those callable/dependency files. Known-TU deletion uses the same delta path.
+Explicitly scoped uncompiled `.cc`, `.cpp`, `.cxx`, and `.cu` files can update
+only their lexical symbols, file records, and freshness in a transaction, including
+file additions and deletions. This requires complete TU dependency provenance,
+unchanged configuration and compilation recipes, and no semantic ownership or
+incident edges. An inferred recipe leaves the file lexical only when preflight
+reports exactly `Clang driver unavailable`. Usable recipes and all other preflight
+errors retain the normal semantic scan and diagnostic path. No TU payload is decoded.
+Header and directory scopes retain the complete scan path. Profile counters
+`lexical_file_delta_scans` and `lexical_file_scan_noops`, and the result's
+`incremental.lexical_files`, distinguish changed and unchanged scoped file work.
 Missing provenance falls back explicitly to complete graph reconstruction and is
 reported by the `incremental_provenance_fallbacks` profile counter. An explicit
 full scan may reconstruct a complete generation; ordinary indexed readers do not.

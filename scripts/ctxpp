@@ -376,7 +376,8 @@ def main(argv: list[str] | None = None) -> int:
                 if not args.read_only:
                     tokenizer.flush()
             else:
-                result = {"format": f"CTXPP-{args.command.upper()}/1", "incomplete": not bool(index_meta(root).get("semantic")),
+                meta = index_meta(root)
+                result = {"format": f"CTXPP-{args.command.upper()}/1", "incomplete": bool(meta.get("incomplete")) or not bool(meta.get("semantic")),
                           "matches": [{k: s.get(k) for k in ("id", "qualified_name", "kind", "file", "line", "definition", "degraded")} for s in matches]}
         elif args.command in ("packet", "inspect"):
             if args.task_spec:

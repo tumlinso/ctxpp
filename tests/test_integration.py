@@ -283,6 +283,40 @@ class IntegrationTests(unittest.TestCase):
         profile = self.profiled("command-change", "scan")["counters"]
         self.assertEqual(profile.get("tus_parsed", 0), 1)
 
+    def test_scoped_uncompiled_file_delta_matches_full_reconstruction(self) -> None:
+        from unittest import mock
+        import ctxpp_store
+        import ctxpp_lib
+        config = self.root / ".ctxpp.toml"
+        config.write_text(config.read_text().replace('"tests/**/*.cpp"]', '"tests/**/*.cpp", "tests/**/*.cu"]'))
+        source = self.root / "tests/lexical_smoke.cu"
+        source.write_text("enum class SmokeMode { initial };\n")
+        self.scan()
+        source.write_text("enum class SmokeMode { updated, another };\n")
+        added = self.root / "tests/lexical_added.cu"
+        added.write_text("struct AddedSmoke { int value; };\n")
+        cfg, _ = load_config(self.root)
+        with mock.patch.object(ctxpp_store.IndexedStore, "iter_records", side_effect=AssertionError("full index")), \
+             mock.patch.object(ctxpp_store.IndexedStore, "all_symbols_edges", side_effect=AssertionError("full graph")), \
+             mock.patch.object(ctxpp_store.IndexedStore, "files", side_effect=AssertionError("all files")), \
+             mock.patch.object(ctxpp_lib, "_read_tu_cache", side_effect=AssertionError("TU cache")), \
+             mock.patch.object(ctxpp_lib, "find_core", side_effect=AssertionError("semantic work")):
+            delta = scan_repository(self.root, cfg, SKILL, scoped=("tests/lexical_smoke.cu", "tests/lexical_added.cu"))
+        self.assertEqual(delta["incremental"]["translation_units"], 0)
+        self.assertEqual(delta["incremental"]["parsed"], 0)
+        self.assertEqual(delta["incremental"]["lexical_files"], 2)
+        after_delta = sorted(stable_json(record) for record in load_index(self.root))
+        (self.root / ".ctxpp/index.sqlite").unlink()
+        scan_repository(self.root, cfg, SKILL)
+        self.assertEqual(after_delta, sorted(stable_json(record) for record in load_index(self.root)))
+        source.unlink()
+        removed = scan_repository(self.root, cfg, SKILL, scoped=("tests/lexical_smoke.cu",))
+        self.assertEqual(removed["incremental"]["lexical_files"], 1)
+        after_delta = sorted(stable_json(record) for record in load_index(self.root))
+        (self.root / ".ctxpp/index.sqlite").unlink()
+        scan_repository(self.root, cfg, SKILL)
+        self.assertEqual(after_delta, sorted(stable_json(record) for record in load_index(self.root)))
+
     def test_localized_delta_matches_full_reconstruction(self) -> None:
         self.scan()
         source = self.root / "src/plan.cpp"

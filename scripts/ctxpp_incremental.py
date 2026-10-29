@@ -1,4 +1,4 @@
-"""Localized semantic TU refresh over the normalized v2 index."""
+"""Localized semantic TU and uncompiled-file refresh over the v2 index."""
 from __future__ import annotations
 
 import json
@@ -10,6 +10,185 @@ from ctxpp_recipe import (infer as infer_recipe, observed_records, persist_succe
                           preflight as recipe_preflight, successful_records,
                           translate as translate_recipe)
 from ctxpp_runtime import ResourceScheduler, run_process_measured, count
+
+
+def scan_lexical_files(root: Path, cfg: dict[str, Any], scoped: tuple[str, ...]) -> dict[str, Any] | None:
+    """Replace explicitly scoped, uncompiled source files without reading TU payloads.
+
+    Complete dependency provenance and unchanged recipe/configuration identity
+    establish that none of these files belongs to the semantic graph. Headers,
+    directory scopes, usable recipes and ambiguous historical rows fall back to
+    the normal scan rather than silently publishing lexical semantic changes.
+    """
+    import ctxpp_lib as lib
+
+    root = root.resolve()
+    selected: set[str] = set()
+    for raw in scoped:
+        path = Path(raw)
+        path = (path if path.is_absolute() else root / path).resolve()
+        try:
+            rel = path.relative_to(root).as_posix()
+        except ValueError:
+            return None
+        if path.suffix not in (".cc", ".cpp", ".cxx", ".cu") or path.is_dir() or lib.is_excluded(rel, cfg):
+            return None
+        selected.add(rel)
+    if not selected:
+        return None
+    store = ctxpp_store.open_store(root)
+    if store is None:
+        return None
+    try:
+        meta = store.meta()
+        if (not store.has_incremental_provenance() or meta.get("format") != "CTXPP-INDEX/1"
+                or meta.get("root") != str(root)
+                or meta.get("config_hash") != lib.sha256_bytes(lib.stable_json(cfg).encode())):
+            return None
+        state = store.metadata("tu_state", {})
+        jobs = state.get("jobs", {})
+        if state.get("format") != "CTXPP-TU-CACHE/1" or not jobs:
+            return None
+        for key, job in jobs.items():
+            dependencies = job.get("dependencies", {})
+            if (not dependencies or not job.get("input_fingerprint")
+                    or key.split("\0", 1)[0] in selected or selected.intersection(dependencies)):
+                return None
+        config_path = root / ".ctxpp.toml"
+        config_hash = lib.sha256_file(config_path) if config_path.is_file() else None
+        compdb_path = lib.find_compdb(root, cfg)
+        determinants = meta.get("determinants", {})
+        compdb_hash = lib.sha256_file(compdb_path) if compdb_path and compdb_path.is_file() else None
+        if determinants.get("compilation_database_hash") != compdb_hash:
+            return None
+        recipes = [*lib.read_compdb(compdb_path, root), *observed_records(root), *successful_records(root)]
+        by_file = lib.compdb_by_file(recipes)
+        compiler_hashes = sorted({lib.sha256_bytes(lib.stable_json(command).encode())
+                                  for commands in by_file.values() for command in commands})
+        if determinants.get("compiler_hashes") != compiler_hashes:
+            return None
+        for rel in selected:
+            path = root / rel
+            if path in by_file:
+                return None
+            if path.is_file():
+                inferred, _, _ = infer_recipe(path, recipes)
+                if inferred is not None:
+                    usable, diagnostic = recipe_preflight(translate_recipe(inferred, path), path)
+                    # Missing optional driver leaves this unowned file lexical.
+                    # Recipe/translation errors must retain normal diagnostics.
+                    if usable or diagnostic != "Clang driver unavailable":
+                        return None
+        prior_files = {rel: store.file(rel) for rel in selected}
+        if any(record and (record.get("translation_units") or record.get("commands")
+                          or record.get("command_hashes")) for record in prior_files.values()):
+            return None
+        # Query the file index directly. File.symbols is metadata, not authority
+        # for deciding which representations need replacing (IDs may repeat).
+        prior_rows = []
+        for rel in sorted(selected):
+            prior_rows.extend(store._symbol(row) for row in store.connection.execute(
+                'SELECT * FROM symbols WHERE file=? ORDER BY symbol_order', (rel,)))
+            if store.connection.execute('SELECT 1 FROM edges WHERE file_id='
+                    '(SELECT id FROM strings WHERE value=?) LIMIT 1', (rel,)).fetchone():
+                return None
+        if any(not row.get("degraded") or any(occurrence.get("translation_unit")
+                for occurrence in row.get("occurrences", [])) for row in prior_rows):
+            return None
+        impacted_ids = {str(row["id"]) for row in prior_rows}
+        for symbol_id in impacted_ids:
+            if store.connection.execute('SELECT 1 FROM edges WHERE from_id='
+                    '(SELECT id FROM strings WHERE value=?) OR to_id='
+                    '(SELECT id FROM strings WHERE value=?) LIMIT 1', (symbol_id, symbol_id)).fetchone():
+                return None
+        freshness = store.freshness()
+        manifest = store.manifest()
+        readiness = store.readiness()
+        generation = store.artifact_identity
+        counts_before = store.counts()
+        digests = {rel: lib.sha256_file(root / rel) if (root / rel).is_file() else None for rel in selected}
+        changed = {rel for rel in selected if (prior_files[rel] or {}).get("hash") != digests[rel]
+                   or (prior_files[rel] is not None and digests[rel] is None)}
+        result = {"backend": meta.get("backend", "degraded-text-routing"),
+                  "files": counts_before[0], "symbols": counts_before[1], "edges": counts_before[2],
+                  "failures": len(meta.get("failures", [])), "cache_hits": 0,
+                  "index": str(ctxpp_store.database_path(root)),
+                  "incremental": {"translation_units": 0, "parsed": 0, "lexical_files": len(changed),
+                                  "symbols_replaced": 0, "store_rows_decoded": len(prior_rows)}}
+        if not changed:
+            count("lexical_file_scan_noops")
+            return result
+        old_rows = [row for row in prior_rows if row.get("file") in changed]
+        new_rows = lib.lexical_symbols(root, [root / rel for rel in sorted(changed) if digests[rel] is not None], [])
+        impacted_ids = {str(row["id"]) for row in [*old_rows, *new_rows]}
+        # apply_delta deletes by semantic ID; retain every other representation
+        # even in a historical artifact with colliding IDs in different files.
+        replacements = store.symbol_records(impacted_ids)
+        preserved = [row for row in replacements if row.get("file") not in changed]
+        desired = [*preserved, *new_rows]
+        store.close()
+        store = None
+        tokenizer = lib.Tokenizer(root, str(cfg.get("tokenizer", "auto")), defer_writes=True)
+        files = []
+        manifest_files = dict(manifest.get("files", {}))
+        freshness_files = dict(freshness.get("files", {}))
+        removed = set()
+        for rel in sorted(changed):
+            if digests[rel] is None:
+                removed.add(rel)
+                manifest_files.pop(rel, None)
+                freshness_files.pop(rel, None)
+                continue
+            path = root / rel
+            data = path.read_bytes()
+            if lib.sha256_bytes(data) != digests[rel]:
+                raise lib.CtxppError(f"source changed during lexical scan: {rel}; retry")
+            tokens = tokenizer.count(data.decode("utf-8", errors="replace"))
+            stat = path.stat()
+            files.append({"record": "file", "path": rel, "hash": digests[rel],
+                "command_hashes": [], "standards": ["unknown"], "commands": [],
+                "tokens": tokens.count, "token_exact": tokens.exact, "tokenizer": tokens.identity,
+                "bytes": len(data), "lines": lib.line_count(data), "classification": lib.classify_file(rel),
+                "translation_units": [], "parse_status": "unobserved", "diagnostics": [],
+                "symbols": sorted(str(row["id"]) for row in new_rows if row.get("file") == rel),
+                "includes": [], "route": None})
+            manifest_files[rel] = digests[rel]
+            freshness_files[rel] = {"hash": digests[rel], "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        coverage = dict(meta.get("coverage", {}))
+        coverage["lexical_only"] = max(0, int(coverage.get("lexical_only", 0)) - len(old_rows) + len(new_rows))
+        next_meta = {**meta, "coverage": coverage,
+                     "incomplete": not meta.get("semantic") or bool(meta.get("failures")) or bool(coverage["lexical_only"])}
+        next_readiness = {**readiness, "rewrite_ready": not readiness.get("semantic_stale_tus")
+                          and not meta.get("failures") and not coverage["lexical_only"] and bool(meta.get("semantic"))}
+        with lib.publication_lock(root):
+            for rel, expected in digests.items():
+                actual = lib.sha256_file(root / rel) if (root / rel).is_file() else None
+                if actual != expected:
+                    raise lib.CtxppError(f"source changed during lexical scan: {rel}; retry")
+            if (lib.sha256_file(config_path) if config_path.is_file() else None) != config_hash:
+                raise lib.CtxppError("configuration changed during lexical scan; retry")
+            if (lib.sha256_file(compdb_path) if compdb_path and compdb_path.is_file() else None) != compdb_hash:
+                raise lib.CtxppError("compilation database changed during lexical scan; retry")
+            current_recipes = [*lib.read_compdb(compdb_path, root), *observed_records(root), *successful_records(root)]
+            if lib.stable_json(current_recipes) != lib.stable_json(recipes):
+                raise lib.CtxppError("compilation recipes changed during lexical scan; retry")
+            ctxpp_store.apply_delta(root, affected_tus=set(), impacted_symbol_ids=impacted_ids,
+                symbols=desired, edges=[], files=files, meta=next_meta,
+                manifest={**manifest, "files": dict(sorted(manifest_files.items()))},
+                freshness={**freshness, "files": dict(sorted(freshness_files.items())), "config_file_hash": config_hash},
+                tu_state=state, readiness=next_readiness, removed_files=removed, expected_generation=generation)
+            lib.refresh_lexical_overlay(root, [root / rel for rel in sorted(changed)], new_rows)
+        tokenizer.flush()
+        count("lexical_file_delta_scans")
+        count("files_lexically_refreshed", len(changed))
+        result.update(files=counts_before[0] - sum(prior_files[rel] is not None for rel in removed)
+                      + sum(prior_files[rel] is None for rel in changed - removed),
+                      symbols=counts_before[1] - len(old_rows) + len(new_rows))
+        result["incremental"].update(symbols_replaced=len(impacted_ids), store_rows_decoded=len(prior_rows) + len(replacements))
+        return result
+    finally:
+        if store is not None:
+            store.close()
 
 
 def scan_incremental(root: Path, cfg: dict[str, Any], skill_root: Path,

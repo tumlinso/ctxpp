@@ -1169,6 +1169,12 @@ def _tu_cache_path(cache_dir: Path, cache_key: str, payload: bytes) -> Path:
 
 def scan_repository(root: Path, cfg: dict[str, Any], skill_root: Path, scoped: Iterable[str] = (), *,
                     refresh_tus: set[str] | None = None) -> dict[str, Any]:
+    scoped = tuple(scoped)
+    if scoped and refresh_tus is None and (index_dir(root) / "index.sqlite").is_file():
+        from ctxpp_incremental import scan_lexical_files
+        lexical_result = scan_lexical_files(root, cfg, scoped)
+        if lexical_result is not None:
+            return lexical_result
     if refresh_tus is not None and (index_dir(root) / "index.sqlite").is_file():
         from ctxpp_incremental import scan_incremental
         incremental_result = scan_incremental(root, cfg, skill_root, refresh_tus)
