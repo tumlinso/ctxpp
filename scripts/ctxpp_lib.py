@@ -6,6 +6,7 @@ import contextlib
 import fcntl
 import fnmatch
 import hashlib
+import heapq
 import json
 import os
 import shlex
@@ -904,6 +905,18 @@ def _merge_core_records(core_records: list[dict[str, Any]]) -> tuple[list[dict[s
         symbol["occurrences"] = sorted({stable_json(x): x for x in symbol.get("occurrences", [])}.values(), key=lambda x: (x.get("file", ""), x.get("start", 0)))
     by_id = {s["id"]: s for s in symbols}
     callable_kinds = {"FunctionDecl", "CXXMethod", "Constructor", "Destructor", "FunctionTemplate", "ConversionFunction"}
+    callable_intervals: dict[str, list[tuple[int, int, int, str]]] = {}
+    for symbol in symbols:
+        if symbol.get("kind") not in callable_kinds:
+            continue
+        start, end = symbol.get("start", 0), symbol.get("end", -1)
+        if start <= end:
+            callable_intervals.setdefault(symbol.get("file", ""), []).append(
+                (start, end, end - start, symbol["id"]))
+    for intervals in callable_intervals.values():
+        intervals.sort(key=lambda interval: (interval[0], interval[1], interval[3]))
+
+    edges_by_file: dict[str, list[dict[str, Any]]] = {}
     for edge in edge_map.values():
         if edge.get("type") not in ("reference", "call", "type_use", "member_access", "macro_expansion"):
             continue
@@ -912,10 +925,28 @@ def _merge_core_records(core_records: list[dict[str, Any]]) -> tuple[list[dict[s
         if (source and source.get("kind") in callable_kinds and source.get("file") == edge.get("file")
                 and source.get("start", 0) <= offset <= source.get("end", -1)):
             continue
-        enclosing = [s for s in symbols if s.get("kind") in callable_kinds and s.get("file") == edge.get("file")
-                     and s.get("start", 0) <= offset <= s.get("end", -1)]
-        if enclosing:
-            edge["from"] = min(enclosing, key=lambda s: (s.get("end", 0) - s.get("start", 0), s["id"]))["id"]
+        edges_by_file.setdefault(edge.get("file", ""), []).append(edge)
+
+    # Sweep each file's edges in source order. The heap is ordered by the same
+    # (range width, symbol ID) key as the former full-symbol search; expired
+    # ranges are discarded lazily, preserving inclusive endpoints and ties.
+    for file, file_edges in edges_by_file.items():
+        intervals = callable_intervals.get(file, [])
+        if not intervals:
+            continue
+        file_edges.sort(key=lambda edge: (int(edge.get("start", -1)), str(edge.get("from", "")), str(edge.get("to", ""))))
+        active: list[tuple[int, str, int]] = []
+        next_interval = 0
+        for edge in file_edges:
+            offset = int(edge.get("start", -1))
+            while next_interval < len(intervals) and intervals[next_interval][0] <= offset:
+                _, end, width, symbol_id = intervals[next_interval]
+                heapq.heappush(active, (width, symbol_id, end))
+                next_interval += 1
+            while active and active[0][2] < offset:
+                heapq.heappop(active)
+            if active:
+                edge["from"] = active[0][1]
     edges = sorted(edge_map.values(), key=lambda x: (x.get("type", ""), x.get("from", ""), x.get("to", ""), x.get("file", ""), x.get("start", 0)))
     return symbols, edges, sorted(observations, key=lambda x: (x.get("file", ""), stable_json(x)))
 
