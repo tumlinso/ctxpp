@@ -601,10 +601,16 @@ def summarize_diagnostics(root: Path, failures: list[dict[str, Any]], operation:
         group["count"] += 1
         if failure.get("file"):
             group["affected_files"].add(str(failure["file"]))
+    try:
+        details_log = log_path.relative_to(root).as_posix()
+    except ValueError:
+        # External state directories are valid; retain a usable locator when
+        # the diagnostic artifact is outside the source repository.
+        details_log = str(log_path)
     summary = []
     for group in sorted(groups.values(), key=lambda value: (value["category"], value["error"]))[:12]:
         group["affected_file_count"] = len(group.pop("affected_files"))
-        group["details_log"] = log_path.relative_to(root).as_posix()
+        group["details_log"] = details_log
         summary.append(group)
     for old in sorted(log_dir.glob("*.log"), key=lambda path: path.stat().st_mtime_ns)[:-16]:
         try: old.unlink()

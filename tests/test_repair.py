@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SKILL = Path(__file__).resolve().parents[1]
@@ -122,6 +123,19 @@ class RepairTests(unittest.TestCase):
         self.assertEqual(summary[0]["category"], "command_translation")
         self.assertTrue((self.root / summary[0]["details_log"]).is_file())
         self.assertLess(len(json.dumps(summary)), 8192)
+
+    def test_external_state_diagnostic_log_uses_absolute_locator(self) -> None:
+        state = Path(self.temp.name) / "external-ctxpp-state"
+        failures = [{"file": "src/base.cpp", "configuration": 0,
+                     "error": "clang: error: unsupported option '--threads'"}]
+        with mock.patch.dict(os.environ, {"CTXPP_STATE_DIR": str(state)}):
+            summary = summarize_diagnostics(self.root, failures, "external-test")
+
+        details_log = Path(summary[0]["details_log"])
+        self.assertTrue(details_log.is_absolute())
+        self.assertEqual(details_log, state / "logs" / details_log.name)
+        self.assertTrue(details_log.is_file())
+        self.assertFalse((self.root / ".ctxpp").exists())
 
     def test_fatal_recipe_preflight_stops_before_ast_and_compatibility_smoke(self) -> None:
         scan, _ = self.ctxpp("scan")
