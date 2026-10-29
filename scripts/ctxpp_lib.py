@@ -1868,7 +1868,9 @@ def _location_matches(root: Path, target: str, semantic: list[dict[str, Any]],
 def resolve_symbols(root: Path, target: str, limit: int = 8) -> list[dict[str, Any]]:
     overlay = lexical_overlay(root)
     overlay_exact = [symbol for symbol in overlay if target in (symbol.get("id"), symbol.get("name"), symbol.get("qualified_name"))]
-    if overlay_exact:
+    # A file stem is a navigation fallback, not an exact semantic symbol. Check
+    # the indexed symbols first when an exact file anchor could shadow one.
+    if overlay_exact and not any(symbol.get("kind") == "LexicalFile" for symbol in overlay_exact):
         return sorted(overlay_exact, key=lambda symbol: (symbol.get("qualified_name") != target, symbol.get("file", "")))[:limit]
     store = open_query_store(root)
     if store:
@@ -1884,6 +1886,8 @@ def resolve_symbols(root: Path, target: str, limit: int = 8) -> list[dict[str, A
             exact = store.exact(target, limit)
             if exact:
                 return sorted(exact, key=lambda s: (s.get("qualified_name") != target, not s.get("definition"), s.get("file", "")))[:limit]
+            if overlay_exact:
+                return sorted(overlay_exact, key=lambda symbol: (symbol.get("qualified_name") != target, symbol.get("file", "")))[:limit]
             query = query_terms(target)
             return rank_candidates(target, [*store.candidates(query), *overlay], limit)
         finally:
@@ -1900,6 +1904,8 @@ def resolve_symbols(root: Path, target: str, limit: int = 8) -> list[dict[str, A
                                           str(symbol.get("qualified_name", ""))))
         return _location_matches(root, target, semantic[:limit], overlay, limit) or []
     if not symbols:
+        if overlay_exact:
+            return sorted(overlay_exact, key=lambda symbol: (symbol.get("qualified_name") != target, symbol.get("file", "")))[:limit]
         return rank_candidates(target, [*overlay, *degraded_locations(root, target, files, limit)], limit)
     if target.startswith("usr:") or target.startswith("c:"):
         exact = [s for s in symbols if s["id"] == target]
@@ -1908,6 +1914,8 @@ def resolve_symbols(root: Path, target: str, limit: int = 8) -> list[dict[str, A
     exact = [s for s in symbols if target in (s.get("qualified_name"), s.get("name"), s.get("id"))]
     if exact:
         return sorted(exact, key=lambda s: (s.get("qualified_name") != target, not s.get("definition"), s.get("file", "")))[:limit]
+    if overlay_exact:
+        return sorted(overlay_exact, key=lambda symbol: (symbol.get("qualified_name") != target, symbol.get("file", "")))[:limit]
     query = query_terms(target)
     return rank_candidates(target, [*symbols, *overlay], limit)
 

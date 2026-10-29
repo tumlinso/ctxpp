@@ -76,6 +76,28 @@ class GlobalOptionTests(unittest.TestCase):
         self.assertEqual(route.returncode, 0, route.stderr)
         self.assertTrue(json.loads(route.stdout)["matches"])
 
+    def test_route_accepts_quoted_and_split_multiword_queries(self) -> None:
+        common = ("--root", str(self.root), "--state-dir", str(self.state), "--read-only", "--json")
+        split = self.cli("route", "alpha", "implementation", "details", "--limit", "1", *common)
+        quoted = self.cli("route", "alpha implementation details", "--limit", "1", *common)
+        self.assertEqual(split.returncode, 0, split.stderr)
+        self.assertEqual(quoted.returncode, 0, quoted.stderr)
+        self.assertEqual(json.loads(split.stdout), json.loads(quoted.stdout))
+        payload = json.loads(split.stdout)
+        self.assertEqual(set(payload), {"format", "incomplete", "matches"})
+        self.assertEqual(len(payload["matches"]), 1)
+
+    def test_human_route_returns_bounded_source_context_without_writing_in_read_only_mode(self) -> None:
+        before = self.state_snapshot()
+        result = self.cli("route", "alpha", "implementation", "details", "--limit", "1", "--budget", "1200",
+                          "--root", str(self.root), "--state-dir", str(self.state), "--read-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("target implementation (canonical source verified; complete range", result.stdout)
+        self.assertIn("int alpha() { return 4; }", result.stdout)
+        self.assertIn("ctxpp inspect alpha-id --intent edit --budget 2400", result.stdout)
+        self.assertLessEqual(len(result.stdout.encode()), 6000)
+        self.assertEqual(self.state_snapshot(), before)
+
     def test_read_only_status_does_not_write_diagnostic_logs(self) -> None:
         before = self.state_snapshot()
         result = self.cli("--root", str(self.root), "--state-dir", str(self.state),
@@ -88,7 +110,7 @@ class GlobalOptionTests(unittest.TestCase):
 
     def test_terminator_keeps_later_option_like_query_as_data(self) -> None:
         result = self.cli("--root", str(self.root), "--state-dir", str(self.state),
-                          "--read-only", "route", "--", "--json")
+                          "--read-only", "--json", "route", "--", "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("matches", json.loads(result.stdout))
 

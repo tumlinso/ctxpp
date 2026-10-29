@@ -27,6 +27,7 @@ From a C++ repository:
 ctxpp init
 ctxpp status
 ctxpp where 'Namespace::Type::method'
+ctxpp route "storage capacity initialization tests"
 ctxpp inspect 'Namespace::Type::method' --intent edit --budget 2400
 ctxpp inspect 'Namespace::Type::method' --intent test --budget 2400
 ```
@@ -41,6 +42,8 @@ For a first install of the skill in Codex, copy
 [`skills/cpp-context-compiler`](skills/cpp-context-compiler) into the Codex skills
 directory or use the skill installer with this repository path.
 
+A human `route` result includes bounded, source-verified context for its best
+current match and alternate locations; use `--json` for the stable match list.
 For test work, `inspect --intent test` gives one bounded view of a target's
 declaration, related data shapes, and indexed test callsite/assertion windows.
 Those source excerpts are freshness-checked and may be partial; an optional

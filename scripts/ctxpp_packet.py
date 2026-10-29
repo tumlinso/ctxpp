@@ -6,6 +6,7 @@ import re
 import shlex
 import sys
 import subprocess
+from collections import Counter
 from pathlib import Path
 import sqlite3
 import tomllib
@@ -14,8 +15,9 @@ from ctxpp_runtime import open_query_store
 from typing import Any
 
 from ctxpp_lib import (CtxppError, Tokenizer, load_index, partition_index,
-                       _cpp_tokens, bounded_graph, recover_target_representation, sha256_bytes, sha256_file,
+                       _cpp_tokens, bounded_graph, recover_target_representation, resolve_symbols, sha256_bytes, sha256_file,
                        source_text, stable_json)
+from ctxpp_rank import GENERIC_TERMS, terms as ranked_terms
 
 
 CONTEXT_KEYS = ("types", "dependencies", "callers", "callees", "tests")
@@ -591,6 +593,50 @@ def _target_block(root: Path, target: dict[str, Any], *, label: str = "target") 
     )
 
 
+def _target_query_excerpt_block(root: Path, target: dict[str, Any], query: str, *,
+                               label: str, max_lines: int = 10) -> tuple[str | None, str | None]:
+    """Show one current, precisely ranged source window when a complete body will not fit."""
+    location = target.get("location") or {}
+    source = _verified_source(root, location)
+    if source is None:
+        return None, f"{label}: source file is missing or changed; excerpt withheld"
+    _, data = source
+    selected = _range_text(data, location)
+    if selected is None:
+        return None, f"{label}: indexed byte range is invalid; excerpt withheld"
+    body, first_line = selected
+    if sha256_bytes(body.encode("utf-8")) != target.get("text_sha256"):
+        return None, f"{label}: indexed range hash does not match; excerpt withheld"
+    lines = body.splitlines()
+    query_terms = set(ranked_terms(query))
+    symbol_terms = set(ranked_terms(str(target.get("name") or target.get("qualified_name") or "")))
+    focused_terms = query_terms - symbol_terms
+    if focused_terms:
+        query_terms = focused_terms
+    if not lines or not query_terms:
+        return None, f"{label}: no query-focused source window is available"
+    line_terms = [set(ranked_terms(line)) for line in lines]
+    term_frequency = Counter(term for values in line_terms for term in values)
+    weights = {term: 1.0 / max(1, count) for term, count in term_frequency.items()}
+    scores = [sum(weights.get(term, 0.0) for term in query_terms & values) for values in line_terms]
+    best_score = max(scores, default=0)
+    if best_score == 0:
+        return None, f"{label}: query terms do not occur in the current indexed range"
+    anchor = scores.index(best_score)
+    width = max(1, min(max_lines, len(lines)))
+    start = max(0, min(anchor - width // 3, len(lines) - width))
+    end = start + width
+    snippet = "\n".join(lines[start:end])
+    numbered, clipped = _numbered_source(snippet, first_line + start, max_line_chars=480)
+    last_line = first_line + end - 1
+    suffix = "; long line clipped" if clipped else ""
+    return (
+        f"{label} (partial query-matched source window; not the full range{suffix}; "
+        f"{location['path']}:{first_line + start}-{last_line})\n{numbered}",
+        None,
+    )
+
+
 def _related_range_block(root: Path, item: dict[str, Any], *, label: str,
                          max_lines: int = RELATED_VIEW_MAX_LINES,
                          max_bytes: int = RELATED_VIEW_MAX_BYTES) -> tuple[str | None, str | None]:
@@ -814,7 +860,16 @@ def _test_callsite_block(root: Path, cluster: dict[str, Any], indexed_files: dic
         return None, f"test callsite window is too large; open {path}:{first_line}"
     relation = ("semantic indexed callsite" if relationship_status == "semantic"
                 else "candidate callsite (relationship not verified)")
-    title = f"tests — {relation}; bounded local window: {item.get('name', item.get('id', 'test'))}"
+    item_location = item.get("location") or {}
+    try:
+        test_start = int(item_location.get("line", 0))
+        test_end = int(item_location.get("end_line", test_start))
+    except (TypeError, ValueError):
+        test_start = test_end = 0
+    full_function = ("Function" in str(item.get("kind", "")) and test_start > 0
+                     and start_line <= test_start and end_line >= test_end)
+    window_kind = "complete indexed test function" if full_function else "partial nearby window; not the full test"
+    title = f"tests — {relation}; {window_kind}: {item.get('name', item.get('id', 'test'))}"
     note = f"source: {path}:{start_line}-{end_line}; indexed callsite: {first_line}-{last_line}"
     if clipped:
         note += "; long line clipped"
@@ -890,7 +945,7 @@ def _configured_test_build_hints(root: Path, test_paths: set[str]) -> list[str]:
 
 
 def _test_intent_blocks(root: Path, target: dict[str, Any], packet: dict[str, Any],
-                        relationship_trust: str) -> tuple[list[tuple[str, str]], list[str]]:
+                        relationship_trust: str, *, route_query: str | None = None) -> tuple[list[tuple[str, str]], list[str]]:
     blocks: list[tuple[str, str]] = []
     skipped: list[str] = []
     graph, graph_error = _test_graph(root, target)
@@ -919,7 +974,18 @@ def _test_intent_blocks(root: Path, target: dict[str, Any], packet: dict[str, An
                 blocks.append(("type", block))
             elif reason:
                 skipped.append(reason)
-        for item in context.get("tests", [])[:4]:
+        test_items = list(context.get("tests", [])[:4])
+        if route_query:
+            query_terms = set(ranked_terms(route_query))
+            test_items.sort(key=lambda item: (
+                -len(query_terms & set(ranked_terms(" ".join((
+                    str(item.get("name", "")), str((item.get("location") or {}).get("path", "")),
+                ))))),
+                str((item.get("location") or {}).get("path", "")),
+                int((item.get("location") or {}).get("line", 0)),
+            ))
+            test_items = test_items[:1]
+        for item in test_items:
             status = "semantic" if relationship_trust == "semantic" and item.get("semantic") else "candidate"
             block, reason = _nearby_source_block(root, item, category="tests", relationship_status=status)
             if block:
@@ -932,7 +998,10 @@ def _test_intent_blocks(root: Path, target: dict[str, Any], packet: dict[str, An
             for item in context.get("tests", [])
             if (item.get("location") or {}).get("path")
         }
-        for hint in _configured_test_build_hints(root, test_paths):
+        hints = _configured_test_build_hints(root, test_paths)
+        if route_query:
+            hints = hints[:1]
+        for hint in hints:
             blocks.append(("build target hint", hint))
         return blocks, skipped
 
@@ -962,16 +1031,45 @@ def _test_intent_blocks(root: Path, target: dict[str, Any], packet: dict[str, An
         0 if str(item.get("kind", "")) in DATA_SHAPE_KINDS - {"EnumDecl"} else 1,
         str(item.get("name", "")), str(item.get("id", "")),
     ))[:max_items]
-    test_clusters = test_clusters[:max_items]
-    selected: list[tuple[str, Any]] = []
-    type_index = test_index = 0
-    while len(selected) < max_items and (type_index < len(type_items) or test_index < len(test_clusters)):
-        if type_index < len(type_items):
-            selected.append(("type", type_items[type_index]))
-            type_index += 1
-        if len(selected) < max_items and test_index < len(test_clusters):
-            selected.append(("test", test_clusters[test_index]))
-            test_index += 1
+    route_test_blocks: dict[tuple[str, int, int], str] = {}
+    if route_query:
+        query_terms = set(ranked_terms(route_query))
+        scored_tests: list[tuple[int, str, int, dict[str, Any], str]] = []
+        for cluster in test_clusters:
+            test_item = cluster["item"]
+            status = ("semantic" if relationship_trust == "semantic" and test_item.get("semantic")
+                      else "candidate")
+            block, block_error = _test_callsite_block(root, cluster, graph["files"], status)
+            if not block:
+                if block_error:
+                    skipped.append(block_error)
+                continue
+            edge = cluster["edge"]
+            start = int(edge["start"])
+            path = str(cluster["path"])
+            score = len(query_terms & set(ranked_terms(block)))
+            scored_tests.append((score, path, start, cluster, block))
+        scored_tests.sort(key=lambda item: (-item[0], item[1], item[2]))
+        selected_test_rows = scored_tests[:1]
+        test_clusters = [item[3] for item in selected_test_rows]
+        route_test_blocks = {
+            (str(cluster["path"]), int(cluster["edge"]["start"]), int(cluster["edge"]["end"])): block
+            for _, _, _, cluster, block in selected_test_rows
+        }
+        selected: list[tuple[str, Any]] = [("type", item) for item in type_items]
+        if test_clusters:
+            selected.append(("test", test_clusters[0]))
+    else:
+        test_clusters = test_clusters[:max_items]
+        selected = []
+        type_index = test_index = 0
+        while len(selected) < max_items and (type_index < len(type_items) or test_index < len(test_clusters)):
+            if type_index < len(type_items):
+                selected.append(("type", type_items[type_index]))
+                type_index += 1
+            if len(selected) < max_items and test_index < len(test_clusters):
+                selected.append(("test", test_clusters[test_index]))
+                test_index += 1
 
     chosen_test_paths: set[str] = set()
     for category, item in selected:
@@ -989,7 +1087,11 @@ def _test_intent_blocks(root: Path, target: dict[str, Any], packet: dict[str, An
         test_item = cluster["item"]
         status = ("semantic" if relationship_trust == "semantic" and test_item.get("semantic")
                   else "candidate")
-        block, block_error = _test_callsite_block(root, cluster, graph["files"], status)
+        cluster_key = (str(cluster["path"]), int(cluster["edge"]["start"]), int(cluster["edge"]["end"]))
+        block = route_test_blocks.get(cluster_key)
+        block_error = None
+        if block is None:
+            block, block_error = _test_callsite_block(root, cluster, graph["files"], status)
         if block:
             blocks.append((f"test:{cluster['path']}:{cluster['edge']['start']}", block))
             chosen_test_paths.add(str(cluster["path"]))
@@ -1003,7 +1105,10 @@ def _test_intent_blocks(root: Path, target: dict[str, Any], packet: dict[str, An
         skipped.append("incident graph reached the 512-edge bound; some types or tests may be omitted")
     if graph["stale_count"] or graph["unknown_count"]:
         skipped.append("stale or provenance-incomplete indexed relationships were withheld")
-    for hint in _configured_test_build_hints(root, chosen_test_paths):
+    hints = _configured_test_build_hints(root, chosen_test_paths)
+    if route_query:
+        hints = hints[:1]
+    for hint in hints:
         blocks.append(("build target hint", hint))
     return blocks, skipped
 
@@ -1137,8 +1242,9 @@ def _context_blocks(root: Path, target: dict[str, Any], context: dict[str, list[
     return blocks, skipped
 
 
-def _bounded_human_view(header: str, blocks: list[tuple[str, str]], *, budget: int,
-                         tokenizer: Tokenizer | None, route: str, omitted: list[str]) -> str:
+def _bounded_human_view_details(header: str, blocks: list[tuple[str, str]], *, budget: int,
+                                tokenizer: Tokenizer | None, route: str,
+                                omitted: list[str]) -> tuple[str, set[str]]:
     def exact_token_count(text: str) -> int:
         return tokenizer.count(text).count if tokenizer is not None else Tokenizer._estimate(text)
 
@@ -1180,6 +1286,7 @@ def _bounded_human_view(header: str, blocks: list[tuple[str, str]], *, budget: i
     if len(result.encode("utf-8")) > AGENT_VIEW_MAX_BYTES or exact_token_count(result) > budget:
         header = header.split("\n", 2)[0] + "\ninsufficient context within this inspect budget; raise --budget to request more."
         selected = []
+        selected_names = []
         excluded = []
         omitted = []
         route = route if len(route.encode("utf-8")) < 280 else "next: rerun ctxpp inspect with a larger --budget"
@@ -1189,6 +1296,14 @@ def _bounded_human_view(header: str, blocks: list[tuple[str, str]], *, budget: i
             result = assemble()
     if not result.endswith("\n"):
         result += "\n"
+    return result, set(selected_names)
+
+
+def _bounded_human_view(header: str, blocks: list[tuple[str, str]], *, budget: int,
+                        tokenizer: Tokenizer | None, route: str, omitted: list[str]) -> str:
+    result, _ = _bounded_human_view_details(
+        header, blocks, budget=budget, tokenizer=tokenizer, route=route, omitted=omitted,
+    )
     return result
 
 
@@ -1218,7 +1333,10 @@ def render_ambiguous_inspect(query: str, candidates: list[dict[str, Any]], *,
     return "\n".join(lines) + "\n"
 
 
-def render_inspect(packet: dict[str, Any], tokenizer: Tokenizer | None = None) -> str:
+def render_inspect(packet: dict[str, Any], tokenizer: Tokenizer | None = None, *,
+                   include_target_source: bool = False, target_label: str = "target source",
+                   route_header: str | None = None, route_footer: str | None = None,
+                   route_query: str | None = None) -> str:
     target = packet["target"]
     location = target["location"]
     root = _view_root(packet)
@@ -1233,6 +1351,8 @@ def render_inspect(packet: dict[str, Any], tokenizer: Tokenizer | None = None) -
     budget = max(1, int(request.get("budget_tokens", 2400)))
     target_line = f"{target['name']} [{target['kind']}] — {location['path']}:{location['line']}-{location['end_line']}"
     header_lines = [target_line]
+    if route_header:
+        header_lines.append(route_header)
     if not current_hash:
         header_lines.append("source=canonical but stale or unverified; code excerpts withheld")
     if intent == "test":
@@ -1255,11 +1375,25 @@ def render_inspect(packet: dict[str, Any], tokenizer: Tokenizer | None = None) -
             header_lines.append("indexed omissions: " + summary)
     blocks: list[tuple[str, str]] = []
     skipped: list[str] = []
+    route_body: str | None = None
     if root is None:
         skipped.append("repository root unavailable")
     elif current_hash:
         if intent == "test":
-            test_blocks, test_skipped = _test_intent_blocks(root, target, packet, relationship_trust)
+            target_source = None
+            if include_target_source:
+                target_source, source_error = _target_block(root, target, label=target_label)
+                if route_query is not None:
+                    route_body = target_source
+                elif target_source:
+                    blocks.append(("target source", target_source))
+                if not target_source and source_error:
+                    skipped.append(source_error)
+            test_blocks, test_skipped = _test_intent_blocks(
+                root, target, packet, relationship_trust, route_query=route_query,
+            )
+            if include_target_source and route_query is None and target_source:
+                test_blocks = [(name, block) for name, block in test_blocks if name != "target declaration"]
             blocks.extend(test_blocks)
             skipped.extend(test_skipped)
         elif not target.get("content") or not packet.get("coverage", {}).get("target_complete", True):
@@ -1279,10 +1413,443 @@ def render_inspect(packet: dict[str, Any], tokenizer: Tokenizer | None = None) -
             skipped.extend(context_skipped)
     else:
         skipped.append("rerun inspect so the current source range and relationships can be verified")
-    route = _packet_route(packet, str(request.get("target", target["name"])),
-                          intent)
+    route = route_footer if route_footer is not None else _packet_route(
+        packet, str(request.get("target", target["name"])), intent,
+    )
+    header = "\n".join(header_lines)
+    if include_target_source and route_query is not None and intent == "test":
+        declaration_blocks = [block for block in blocks if block[0] == "target declaration"]
+        context_blocks = [block for block in blocks if block[0] != "target declaration"]
+        if route_body:
+            body_view, shown = _bounded_human_view_details(
+                header, [*context_blocks, ("target body", route_body)],
+                budget=budget, tokenizer=tokenizer, route=route, omitted=skipped,
+            )
+            required_context = {name for name, _ in context_blocks}
+            if "target body" in shown and required_context <= shown:
+                return body_view
+        if root is not None and current_hash:
+            excerpt, excerpt_error = _target_query_excerpt_block(
+                root, target, route_query, label=target_label,
+            )
+            if excerpt:
+                excerpt_omitted = [*skipped, "complete implementation body did not fit; query-matched source excerpt is partial"]
+                excerpt_view, excerpt_shown = _bounded_human_view_details(
+                    header, [*declaration_blocks, *context_blocks, ("target excerpt", excerpt)],
+                    budget=budget, tokenizer=tokenizer, route=route, omitted=excerpt_omitted,
+                )
+                required_excerpt = {name for name, _ in [*declaration_blocks, *context_blocks]}
+                if "target excerpt" in excerpt_shown and required_excerpt <= excerpt_shown:
+                    return excerpt_view
+            elif excerpt_error:
+                skipped.append(excerpt_error)
+        body_note = "implementation body omitted; retaining the bounded declaration and indexed context"
+        fallback_omitted = [*skipped, body_note]
+        if not declaration_blocks:
+            fallback_omitted.append("target declaration unavailable; use the expansion command to inspect the canonical range")
+        fallback_blocks = [*declaration_blocks, *context_blocks]
+        return _bounded_human_view(
+            header, fallback_blocks, budget=budget, tokenizer=tokenizer,
+            route=route, omitted=fallback_omitted,
+        )
     return _bounded_human_view("\n".join(header_lines), blocks, budget=budget, tokenizer=tokenizer,
                                route=route, omitted=skipped)
+
+
+_ROUTE_MEMBER_KINDS = frozenset({"FieldDecl", "EnumConstantDecl", "ParmDecl", "VarDecl"})
+
+
+def _is_function_like_kind(kind: str) -> bool:
+    return any(marker in kind for marker in ("Function", "Method", "Constructor", "Destructor", "Conversion"))
+
+
+def _route_name_tokens(candidate: dict[str, Any]) -> list[str]:
+    qualified = str(candidate.get("qualified_name") or candidate.get("name") or "")
+    return ranked_terms(qualified.rsplit("::", 1)[-1])
+
+
+def _route_name_is_explicit(query: str, candidate: dict[str, Any]) -> bool:
+    name_tokens = _route_name_tokens(candidate)
+    if not name_tokens or (len(name_tokens) == 1 and name_tokens[0] in (GENERIC_TERMS | {"high", "low", "test", "tests"})):
+        return False
+    query_tokens = ranked_terms(query)
+    width = len(name_tokens)
+    return any(query_tokens[offset:offset + width] == name_tokens
+               for offset in range(max(0, len(query_tokens) - width + 1)))
+
+
+def _route_parent_target(root: Path, child: dict[str, Any], rank: int) -> dict[str, Any] | None:
+    kind = str(child.get("kind", ""))
+    qualified = str(child.get("qualified_name") or "")
+    if kind not in _ROUTE_MEMBER_KINDS or "::" not in qualified or child.get("degraded"):
+        return None
+    parent_name = qualified.rsplit("::", 1)[0]
+    try:
+        parents = resolve_symbols(root, parent_name, limit=8)
+    except (CtxppError, OSError, ValueError, TypeError, KeyError, sqlite3.Error, RuntimeError):
+        return None
+    viable = [parent for parent in parents
+              if parent.get("qualified_name") == parent_name
+              and (parent.get("kind") in DATA_SHAPE_KINDS if kind in {"FieldDecl", "EnumConstantDecl"}
+                   else _is_function_like_kind(str(parent.get("kind", ""))))
+              and not parent.get("degraded")]
+    if not viable:
+        return None
+    child_file = str(child.get("file", ""))
+    child_line = int(child.get("line", 0) or 0)
+    containing = [parent for parent in viable
+                  if str(parent.get("file", "")) == child_file
+                  and int(parent.get("line", 0) or 0) <= child_line <= int(parent.get("end_line", 0) or 0)]
+    parent = sorted(containing or viable, key=lambda item: (
+        not bool(item.get("definition")),
+        str(item.get("file", "")) != child_file,
+        str(item.get("file", "")),
+        int(item.get("line", 0) or 0),
+    ))[0]
+    return {
+        **parent,
+        "_route_confidence": child.get("_route_confidence", "unknown"),
+        "_route_rank": rank,
+        "_route_match_candidate": child,
+        "_route_parent_selection": True,
+    }
+
+
+def _route_context_candidates(root: Path, query: str,
+                              candidates: list[dict[str, Any]]) -> list[tuple[int, dict[str, Any]]]:
+    """Order only plausible semantic targets for a source-context route.
+
+    The JSON route keeps its established ranking. Human presentation adds an
+    exact-name preference and promotes member hits to their indexed owner so a
+    lone field/enum value does not masquerade as a useful coding context.
+    """
+    ranked = list(enumerate(candidates[:32], start=1))
+    semantic = [(rank, item) for rank, item in ranked
+                if not item.get("degraded") and not str(item.get("kind", "")).startswith("Lexical")]
+
+    def unique_targets(values: list[tuple[int, dict[str, Any]]]) -> list[tuple[int, dict[str, Any]]]:
+        seen: set[str] = set()
+        result = []
+        for rank, item in values:
+            identity = str(item.get("id", ""))
+            if not identity or identity in seen:
+                continue
+            seen.add(identity)
+            result.append((rank, item))
+        return result
+
+    explicit: list[tuple[int, int, dict[str, Any]]] = []
+    for rank, item in semantic:
+        if not _route_name_is_explicit(query, item):
+            continue
+        width = len(_route_name_tokens(item))
+        parent = _route_parent_target(root, item, rank)
+        explicit.append((width, rank, parent or {**item, "_route_rank": rank}))
+    if explicit:
+        explicit.sort(key=lambda row: (-row[0], row[1]))
+        return unique_targets([(rank, target) for _, rank, target in explicit])
+
+    confident = [(rank, item) for rank, item in semantic
+                 if item.get("_route_confidence") == "high"]
+    if confident:
+        parents: list[tuple[int, int, int, dict[str, Any]]] = []
+        for rank, item in confident[:8]:
+            parent = _route_parent_target(root, item, rank)
+            if parent:
+                score = len(set(ranked_terms(query)) & set(ranked_terms(str(item.get("qualified_name", "")))))
+                parents.append((-score, rank, 0, parent))
+        if parents:
+            parents.sort(key=lambda row: row[:3])
+            parent_ids = {str(row[3].get("id", "")) for row in parents}
+            return unique_targets([(rank, target) for _, rank, _, target in parents] + [
+                (rank, item) for rank, item in confident if str(item.get("id", "")) not in parent_ids
+            ])
+        return unique_targets(confident)
+
+    # For weaker phrases, a member's semantic owner can still provide a useful
+    # shape/API view when its qualified name overlaps several query terms.
+    query_terms = set(ranked_terms(query))
+    parents: list[tuple[int, int, dict[str, Any]]] = []
+    for rank, item in semantic:
+        parent = _route_parent_target(root, item, rank)
+        child_name = set(ranked_terms(str(item.get("qualified_name", ""))))
+        if parent:
+            parent_name = set(ranked_terms(str(parent.get("qualified_name", ""))))
+            parent_overlap = len(query_terms & parent_name)
+            overlap = len(query_terms & child_name) + parent_overlap
+            if parent_overlap >= 2:
+                parents.append((-overlap, rank, parent))
+        elif item.get("_route_confidence") == "medium" and len(query_terms & child_name) >= 2:
+            parents.append((-len(query_terms & child_name), rank, item))
+    parents.sort(key=lambda row: (row[0], row[1]))
+    if parents:
+        return unique_targets([(rank, target) for _, rank, target in parents])
+    return []
+
+
+def _route_identifier_reference_targets(root: Path, query: str,
+                                       candidates: list[dict[str, Any]]) -> list[tuple[int, dict[str, Any]]]:
+    """Resolve code-like query tokens through a small, current incoming graph neighborhood."""
+    identifiers = list(dict.fromkeys(
+        word for word in re.findall(r"[A-Za-z_][A-Za-z_0-9]*", query)
+        if "_" in word or any(char.isdigit() for char in word)
+    ))[:4]
+    if not identifiers:
+        return []
+    known_ranks = {str(item.get("id", "")): rank for rank, item in enumerate(candidates, start=1)}
+    seeds: list[tuple[str, dict[str, Any], int]] = []
+    seen_seeds: set[str] = set()
+    for identifier in identifiers:
+        try:
+            matches = resolve_symbols(root, identifier, limit=8)
+        except (CtxppError, OSError, ValueError, TypeError, KeyError, sqlite3.Error, RuntimeError):
+            continue
+        for seed in matches:
+            kind = str(seed.get("kind", ""))
+            seed_id = str(seed.get("id", ""))
+            if (not seed_id or seed_id in seen_seeds or seed.get("degraded")
+                    or kind.startswith("Lexical") or kind == "LexicalFile"):
+                continue
+            seen_seeds.add(seed_id)
+            seeds.append((identifier, seed, known_ranks.get(seed_id, 0)))
+            break
+
+    expanded: dict[str, tuple[int, int, dict[str, Any]]] = {}
+    for match_token, seed, rank in seeds:
+        seed_id = str(seed.get("id", ""))
+        graph_target = {key: seed.get(key) for key in ("id", "name", "qualified_name", "kind", "file", "start", "end")}
+        try:
+            meta, files, symbols, edges, _ = bounded_graph(root, graph_target, limit=128)
+        except (OSError, ValueError, RuntimeError, sqlite3.Error, TypeError, KeyError):
+            continue
+        indexed_files = {str(item.get("path", "")): item for item in files if item.get("path")}
+        stale_files = set(str(path) for path in meta.get("_stale_relationship_files", []))
+        stale_tus = set(str(path) for path in meta.get("_stale_relationship_tus", []))
+        provenance_incomplete = bool(meta.get("_relationship_provenance_incomplete"))
+        current_files: dict[str, bool] = {}
+
+        def file_current(path: str) -> bool:
+            if path in current_files:
+                return current_files[path]
+            indexed = indexed_files.get(path)
+            if not indexed or not indexed.get("hash"):
+                current_files[path] = False
+            else:
+                current_files[path] = _verified_source(
+                    root, {"path": path, "content_sha256": str(indexed["hash"])},
+                ) is not None
+            return current_files[path]
+
+        seed_path = str(seed.get("file", ""))
+        if seed_path in stale_files or not file_current(seed_path):
+            continue
+        by_id = {str(item.get("id", "")): item for item in symbols if item.get("id")}
+        # Keep source-hash checks for this expansion small even when a common
+        # symbol has many indexed references.
+        for edge in edges[:32]:
+            relation = str(edge.get("type", ""))
+            if (relation not in {"reference", "call"} or str(edge.get("to", "")) != seed_id
+                    or edge.get("degraded") or edge.get("lexical") or edge.get("semantic") is False):
+                continue
+            source = by_id.get(str(edge.get("from", "")))
+            if not source or source.get("degraded"):
+                continue
+            source_kind = str(source.get("kind", ""))
+            if not _is_function_like_kind(source_kind):
+                continue
+            edge_file = str(edge.get("file", ""))
+            source_file = str(source.get("file", ""))
+            translation_unit = str(edge.get("translation_unit", ""))
+            if (not edge_file or not source_file or edge_file in stale_files or source_file in stale_files
+                    or (translation_unit and translation_unit in stale_tus)
+                    or (provenance_incomplete and not translation_unit)
+                    or not file_current(edge_file) or not file_current(source_file)):
+                continue
+            target = {
+                **source,
+                "_route_confidence": seed.get("_route_confidence", "low"),
+                "_route_rank": rank,
+                "_route_match_candidate": seed,
+                "_route_reference_expansion": relation,
+                "_route_match_token": match_token,
+            }
+            identity = str(target.get("id", ""))
+            if not identity:
+                continue
+            score = len(set(ranked_terms(query)) & set(ranked_terms(str(target.get("qualified_name", "")))))
+            key = (0 if relation == "call" else 1, -score, target)
+            previous = expanded.get(identity)
+            if previous is None or key[:2] < previous[:2]:
+                expanded[identity] = key
+    ordered = sorted(expanded.values(), key=lambda row: (row[0], row[1], str(row[2].get("qualified_name", "")),
+                                                         str(row[2].get("file", ""))))
+    return [(int(item.get("_route_rank", 0)), item) for _, _, item in ordered[:8]]
+
+
+def render_route(root: Path, query: str, candidates: list[dict[str, Any]], *, budget: int,
+                 tokenizer: Tokenizer, limit: int = 8, read_only: bool = False) -> str:
+    """Render one bounded source-backed route without promoting weak matches to targets."""
+    budget = max(1, int(budget))
+    max_items = 12
+    route_targets = _route_context_candidates(root, query, candidates)
+    if not route_targets or route_targets[0][1].get("_route_parent_selection"):
+        expanded_targets = _route_identifier_reference_targets(root, query, candidates)
+        if route_targets:
+            route_targets = expanded_targets + route_targets
+        else:
+            route_targets = expanded_targets
+    seen_target_ids: set[str] = set()
+    unique_route_targets = []
+    for rank, item in route_targets:
+        identity = str(item.get("id", ""))
+        if not identity or identity in seen_target_ids:
+            continue
+        seen_target_ids.add(identity)
+        unique_route_targets.append((rank, item))
+    route_targets = unique_route_targets
+    selected: tuple[int, dict[str, Any], dict[str, Any]] | None = None
+    stale: tuple[int, dict[str, Any], dict[str, Any]] | None = None
+    unavailable: list[str] = []
+
+    for rank, candidate in route_targets[:8]:
+        identity = str(candidate.get("id", ""))
+        name = str(candidate.get("qualified_name") or candidate.get("name") or identity or "unknown")
+        location = f"{candidate.get('file', '?')}:{candidate.get('line', '?')}"
+        if not identity:
+            unavailable.append(f"{name} at {location}: no indexed identity")
+            continue
+        if candidate.get("kind") == "LexicalFile":
+            unavailable.append(f"{name} at {location}: file anchor has no symbol range")
+            continue
+        try:
+            packet = build_context_packet(
+                root, identity, candidate, intent="test", budget=budget,
+                max_items=max_items, tokenizer=tokenizer,
+            )
+        except (CtxppError, OSError, ValueError, TypeError, KeyError, sqlite3.Error, RuntimeError) as exc:
+            unavailable.append(f"{name} at {location}: source context unavailable ({type(exc).__name__})")
+            continue
+        entry = (rank, candidate, packet)
+        if packet.get("trust", {}).get("target_range") == "hash-verified":
+            selected = entry
+            break
+        if stale is None:
+            stale = entry
+
+    if selected is None:
+        selected = stale
+    if selected is None:
+        header = (f"route {query!r}: no confident semantic target; only weak or lexical matches"
+                  if candidates and not route_targets else
+                  f"route {query!r}: no source-verified symbol context available")
+        blocks: list[tuple[str, str]] = []
+        if candidates:
+            lines = ["ranked navigation locations only; match confidence is not a source relationship:"]
+            for candidate in candidates[:3]:
+                identity = str(candidate.get("id", ""))
+                name = str(candidate.get("qualified_name") or candidate.get("name") or identity or "unknown")
+                confidence = str(candidate.get("_route_confidence", "unknown"))
+                lexical = "; lexical fallback" if candidate.get("degraded") or str(candidate.get("kind", "")).startswith("Lexical") else ""
+                lines.append(
+                    f"- {name} [{candidate.get('kind', 'unknown')}; confidence={confidence}{lexical}] "
+                    f"— {candidate.get('file', '?')}:{candidate.get('line', '?')}"
+                )
+                if identity:
+                    command = "where" if candidate.get("degraded") or str(candidate.get("kind", "")).startswith("Lexical") else "inspect"
+                    arguments = ["ctxpp", command, identity]
+                    if command == "inspect":
+                        arguments.extend(("--intent", "test", "--budget", str(budget)))
+                    lines.append("  open: " + shlex.join(arguments))
+            blocks.append(("candidates", "\n".join(lines)))
+        elif not candidates:
+            header = f"route {query!r}: no indexed candidates"
+        route_argv = ["ctxpp", "route", query, "--limit", str(min(32, max(8, limit * 2))), "--budget", str(min(1_000_000, budget * 2))]
+        footer = "next: " + shlex.join(route_argv)
+        if unavailable:
+            unavailable = unavailable[:3]
+        output = _bounded_human_view(header, blocks, budget=budget, tokenizer=tokenizer,
+                                     route=footer, omitted=unavailable)
+        return output
+
+    rank, candidate, packet = selected
+    request = dict(packet.get("request", {}))
+    request.update({"target": str(candidate.get("id", "")), "intent": "test",
+                    "budget_tokens": budget, "max_items": max_items})
+    packet = {**packet, "request": request}
+    location = candidate.get("file", "?")
+    line = candidate.get("line", "?")
+    confidence = str(candidate.get("_route_confidence", "unknown"))
+    rank = int(candidate.get("_route_rank", rank))
+    matched = candidate.get("_route_match_candidate")
+    reference_expansion = str(candidate.get("_route_reference_expansion", ""))
+    if reference_expansion:
+        selection_label = f"candidate via current indexed incoming {reference_expansion}"
+    elif candidate.get("_route_parent_selection"):
+        selection_label = "selected owner of matching indexed member"
+    elif _route_name_is_explicit(query, candidate):
+        selection_label = "selected exact-name symbol"
+    else:
+        selection_label = "selected semantic match"
+    rank_text = f"rank={rank}/{len(candidates)} " if rank > 0 else ""
+    route_header = f"route query={query!r}; {selection_label} {rank_text}confidence={confidence} — {location}:{line}"
+    if isinstance(matched, dict):
+        match_name = str(matched.get("qualified_name") or matched.get("name") or matched.get("id", "member"))
+        if reference_expansion:
+            route_header += f"; matched token source={match_name} at {matched.get('file', '?')}:{matched.get('line', '?')}"
+        else:
+            route_header += f"; ranked member={match_name} at {matched.get('file', '?')}:{matched.get('line', '?')}"
+
+    expanded_budget = min(1_000_000, max(1, budget) * 2)
+    chosen_id = str(candidate.get("id", ""))
+    chosen_ref = chosen_id
+    if len(chosen_ref) > 80 and candidate.get("file") and candidate.get("line"):
+        chosen_ref = f"{candidate['file']}:{candidate['line']}"
+    footer_lines = ["expand: " + shlex.join(
+        ["ctxpp", "inspect", chosen_ref, "--intent", "edit", "--budget", str(expanded_budget)],
+    )]
+    if unavailable:
+        for item in unavailable[:2]:
+            footer_lines.append("not selected: " + item)
+    matched_id = str(matched.get("id", "")) if isinstance(matched, dict) else ""
+    chosen_name = str(candidate.get("qualified_name") or candidate.get("name") or "")
+    alternates = []
+    for item in candidates:
+        identity = str(item.get("id", ""))
+        item_name = str(item.get("qualified_name") or item.get("name") or "")
+        if reference_expansion and (item.get("degraded") or str(item.get("kind", "")).startswith("Lexical")):
+            continue
+        if identity in {chosen_id, matched_id} or item_name == chosen_name or item_name.startswith(chosen_name + "::"):
+            continue
+        alternates.append(item)
+        if len(alternates) >= 1:
+            break
+    if alternates:
+        footer_lines.append("other query candidates (locations only; not structural relationships):")
+        for item in alternates:
+            identity = str(item.get("id", ""))
+            item_name = str(item.get("qualified_name") or item.get("name") or identity or "unknown")
+            item_location = f"{item.get('file', '?')}:{item.get('line', '?')}"
+            footer_lines.append(f"- {item_name} [{item.get('kind', 'unknown')}] — {item_location}")
+            if identity:
+                command = "where"
+                location_ref = f"{item.get('file', '?')}:{item.get('line', '?')}"
+                arguments = ["ctxpp", command, location_ref]
+                footer_lines.append("  locate: " + shlex.join(arguments))
+    if len(candidates) > len(alternates) + 1:
+        footer_lines.append("more: " + shlex.join(
+            ["ctxpp", "route", query, "--limit", str(min(32, max(8, limit * 2))), "--budget", str(budget)],
+        ))
+    if packet.get("trust", {}).get("target_range") != "hash-verified":
+        refresh = shlex.join(["ctxpp", "route", query, "--budget", str(budget)])
+        footer_lines.append("refresh current source: " + refresh + (" (omit --read-only)" if read_only else ""))
+
+    target_label = "target test" if candidate.get("is_test") else (
+        "target implementation" if "Function" in str(candidate.get("kind", "")) else "target source"
+    )
+    return render_inspect(
+        packet, tokenizer, include_target_source=True, target_label=target_label,
+        route_header=route_header, route_footer="\n".join(footer_lines), route_query=query,
+    )
 
 
 def render_task_inspect(packet: dict[str, Any], tokenizer: Tokenizer | None = None) -> str:

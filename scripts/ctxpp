@@ -78,7 +78,7 @@ from ctxpp_agents import (  # noqa: E402
     AgentInstructionsError, prepare_agent_instructions, write_agent_instructions,
 )
 from ctxpp_packet import (build_context_packet, build_task_packet, render_ambiguous_inspect,
-                          render_inspect, render_task_inspect)  # noqa: E402
+                          render_inspect, render_route, render_task_inspect)  # noqa: E402
 
 
 def parser() -> argparse.ArgumentParser:
@@ -101,8 +101,14 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("compress-cache", help="verify and compress captured legacy TU caches")
     scan = sub.add_parser("scan"); scan.add_argument("paths", nargs="*")
     where = sub.add_parser("where"); where.add_argument("target"); where.add_argument("--limit", type=int, default=8)
-    route = sub.add_parser("route", help="find symbols and paths related to a short natural-language query")
-    route.add_argument("query"); route.add_argument("--limit", type=int, default=8)
+    route = sub.add_parser(
+        "route", help="find source context related to a natural-language query",
+        description=("Find bounded source context for the best current match and show alternatives. "
+                     "Quote a phrase or pass its words separately. Use --json for the stable match list."),
+    )
+    route.add_argument("query", nargs="+", metavar="WORD", help="natural-language query words")
+    route.add_argument("--limit", type=int, default=8, help="maximum ranked candidates to consider")
+    route.add_argument("--budget", type=int, help="human context token budget (defaults to configured slice budget)")
     for name in ("packet", "inspect"):
         description = None
         help_text = None
@@ -115,7 +121,7 @@ def parser() -> argparse.ArgumentParser:
                 "contract/declaration, related data shapes, bounded indexed test callsites, and a "
                 "build-target hint when the compilation database maps the test source. The hint does "
                 "not report test status. "
-                "Use where SYMBOL for a direct symbol location; use route WORDS for a natural-language query. "
+                "Use where SYMBOL for a direct location; use `ctxpp route \"WORDS HERE\"` or pass query words separately. "
                 "Intents apply to inspect, packet, and slice."
             )
         cmd = sub.add_parser(name, help=help_text, description=description)
@@ -357,10 +363,21 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "scan":
             result = {"format": "CTXPP-SCAN/1", **scan_repository(root, cfg, skill_root, args.paths)}
         elif args.command in ("where", "route"):
-            prepare_query(args.target if args.command == "where" else args.query)
-            matches = resolve_symbols(root, args.target, args.limit) if args.command == "where" else route_symbols(root, args.query, args.limit)
-            result = {"format": f"CTXPP-{args.command.upper()}/1", "incomplete": not bool(index_meta(root).get("semantic")),
-                      "matches": [{k: s.get(k) for k in ("id", "qualified_name", "kind", "file", "line", "definition", "degraded")} for s in matches]}
+            query = args.target if args.command == "where" else " ".join(args.query)
+            prepare_query(query)
+            matches = resolve_symbols(root, query, args.limit) if args.command == "where" else route_symbols(root, query, args.limit)
+            if args.command == "route" and not args.json:
+                budget = args.budget if args.budget is not None else int(cfg.get("budgets", {}).get("default_slice_tokens", 2400))
+                if budget <= 0:
+                    raise CtxppError("route budget must be positive")
+                tokenizer = Tokenizer(root, str(cfg.get("tokenizer", "auto")), defer_writes=True)
+                result = render_route(root, query, matches, budget=budget, tokenizer=tokenizer,
+                                      limit=args.limit, read_only=args.read_only)
+                if not args.read_only:
+                    tokenizer.flush()
+            else:
+                result = {"format": f"CTXPP-{args.command.upper()}/1", "incomplete": not bool(index_meta(root).get("semantic")),
+                          "matches": [{k: s.get(k) for k in ("id", "qualified_name", "kind", "file", "line", "definition", "degraded")} for s in matches]}
         elif args.command in ("packet", "inspect"):
             if args.task_spec:
                 if args.target:
@@ -407,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
                         resolved.append((query, exact))
                         seen.add(exact["id"])
                 tokenizer = Tokenizer(root, str(cfg.get("tokenizer", "auto")), defer_writes=True)
-                budget = args.budget or int(cfg.get("budgets", {}).get("default_slice_tokens", 2400))
+                budget = args.budget if args.budget is not None else int(cfg.get("budgets", {}).get("default_slice_tokens", 2400))
                 packet = build_task_packet(
                     root, spec, resolved, consumer=args.consumer, intent=intent,
                     budget=budget, max_items=args.max_items, tokenizer=tokenizer,
@@ -429,14 +446,14 @@ def main(argv: list[str] | None = None) -> int:
                     for symbol in matches
                 ]}
                 if args.command == "inspect" and not args.json:
-                    budget = args.budget or int(cfg.get("budgets", {}).get("default_slice_tokens", 2400))
+                    budget = args.budget if args.budget is not None else int(cfg.get("budgets", {}).get("default_slice_tokens", 2400))
                     result = render_ambiguous_inspect(args.target, ambiguous["candidates"],
                                                       intent=args.intent, budget=budget)
                 else:
                     result = ambiguous
             else:
                 tokenizer = Tokenizer(root, str(cfg.get("tokenizer", "auto")), defer_writes=True)
-                budget = args.budget or int(cfg.get("budgets", {}).get("default_slice_tokens", 2400))
+                budget = args.budget if args.budget is not None else int(cfg.get("budgets", {}).get("default_slice_tokens", 2400))
                 packet = build_context_packet(root, args.target, matches[0], intent=args.intent, budget=budget,
                                               max_items=args.max_items, tokenizer=tokenizer)
                 result = packet if args.command == "packet" or args.json else render_inspect(packet, tokenizer)
@@ -450,7 +467,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = {"format": "CTXPP-AMBIGUOUS/1", "candidates": [{"id": s["id"], "name": s.get("qualified_name"), "file": s.get("file"), "line": s.get("line")} for s in matches]}
             else:
                 target = matches[0]
-                budget = args.budget or int(cfg.get("budgets", {}).get("default_slice_tokens", 2400))
+                budget = args.budget if args.budget is not None else int(cfg.get("budgets", {}).get("default_slice_tokens", 2400))
                 tokenizer = Tokenizer(root, str(cfg.get("tokenizer", "auto")), defer_writes=True)
                 core = find_core(skill_root)
                 tokenizer_cache_identity = tokenizer.cache_identity()

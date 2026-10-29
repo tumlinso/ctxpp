@@ -12,7 +12,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import ctxpp_store as storage
-from ctxpp_lib import bounded_graph, resolve_symbols
+from ctxpp_lib import bounded_graph, refresh_lexical_overlay, resolve_symbols
 
 
 class IndexedStoreTests(unittest.TestCase):
@@ -85,6 +85,42 @@ class IndexedStoreTests(unittest.TestCase):
             self.assertEqual(len(edges), 1)
             self.assertFalse(truncated)
             self.assertEqual({item['id'] for item in symbols}, {'same', 'other'})
+
+    def test_semantic_exact_symbol_outranks_file_stem_and_lexical_file_fallback_remains(self):
+        source_dir = self.root / 'include/pkg'
+        source_dir.mkdir(parents=True)
+        file_anchor = source_dir / 'identity_registry.hh'
+        file_anchor.write_text('#pragma once\n#include "registry_types.hh"\n')
+        semantic_path = source_dir / 'registry_types.hh'
+        semantic_text = 'namespace pkg { struct identity_registry { int value; }; }\n'
+        semantic_path.write_text(semantic_text)
+        orphan_path = source_dir / 'orphan.hh'
+        orphan_path.write_text('#pragma once\n')
+        semantic_symbol = {
+            'record': 'symbol', 'id': 'c:@N@pkg@S@identity_registry',
+            'name': 'identity_registry', 'qualified_name': 'pkg::identity_registry',
+            'kind': 'StructDecl', 'file': 'include/pkg/registry_types.hh',
+            'line': 1, 'end_line': 1, 'start': semantic_text.index('struct'),
+            'end': len(semantic_text) - 1, 'definition': True,
+        }
+        state = self.root / '.ctxpp'
+        records = [
+            {'record': 'meta', 'format': 'CTXPP-INDEX/1', 'root': str(self.root), 'semantic': True},
+            {'record': 'file', 'path': semantic_symbol['file'],
+             'hash': hashlib.sha256(semantic_text.encode()).hexdigest(), 'commands': []},
+            semantic_symbol,
+        ]
+        with mock.patch.dict('os.environ', {'CTXPP_STATE_DIR': str(state)}):
+            storage.publish(self.root, records, {'files': {}}, {'files': {}}, state_path=state)
+            refresh_lexical_overlay(self.root, [file_anchor, semantic_path, orphan_path])
+
+            resolved = resolve_symbols(self.root, 'identity_registry')
+            fallback = resolve_symbols(self.root, 'orphan')
+
+        self.assertEqual([item['id'] for item in resolved], ['c:@N@pkg@S@identity_registry'])
+        self.assertEqual(resolved[0]['kind'], 'StructDecl')
+        self.assertEqual([item['kind'] for item in fallback], ['LexicalFile'])
+        self.assertEqual(fallback[0]['file'], 'include/pkg/orphan.hh')
 
     def test_store_corruption_is_reported(self):
         self.publish()
