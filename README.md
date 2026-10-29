@@ -14,6 +14,10 @@ library. Install from this repository with pip:
 python -m pip install .
 ```
 
+The CLI is standalone. Installing this package does not install a Codex skill,
+modify a repository, or register a Project Control integration. Use `ctxpp init`
+only when opting a specific repository into ctxpp.
+
 The optional native parser requires CMake 3.20, a C++17 compiler, and a usable
 libclang runtime. `ctxpp init` builds it when available. The binary is placed in
 the user's cache, outside the installed package. Set `CTXPP_CORE` to use an
@@ -32,15 +36,19 @@ ctxpp inspect 'Namespace::Type::method' --intent edit --budget 2400
 ctxpp inspect 'Namespace::Type::method' --intent test --budget 2400
 ```
 
-`init` creates `.ctxpp.toml` if it is absent, preserves existing settings,
-indexes the repository, and adds a managed C++ routing block to root
-`AGENTS.md`. Use `--agent-instructions=skip` when another host manages repository
-instructions. The block is portable and may suggest installing the bundled
-`cpp-context-compiler` skill.
+`init` is an explicit opt-in for one repository. It creates `.ctxpp.toml` if it
+is absent, preserves existing settings, indexes the repository, and adds a
+managed C++ routing block to root `AGENTS.md`. Use
+`--agent-instructions=skip` when another host manages repository instructions.
+The block is portable and may suggest installing the bundled
+`cpp-context-compiler` skill. Initialization does not install a skill or
+configure Project Control.
 
-For a first install of the skill in Codex, copy
-[`skills/cpp-context-compiler`](skills/cpp-context-compiler) into the Codex skills
-directory or use the skill installer with this repository path.
+The skill is optional guidance for Codex. If useful, install
+[`skills/cpp-context-compiler`](skills/cpp-context-compiler) in the Codex skill
+scope you choose, or use the skill installer with this repository path. The
+standalone CLI and `init` do not depend on the skill; installing it does not
+make ctxpp a Project Control default.
 
 A human `route` result includes bounded, source-verified context for its best
 current match and alternate locations; use `--json` for the stable match list.
