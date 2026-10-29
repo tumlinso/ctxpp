@@ -29,8 +29,10 @@ Read [comment contracts](references/comment-contracts.md) only for comment chang
 
 ## Open
 
-1. On explicit use, run `ctxpp --root ROOT init`. Initialization preserves an existing `.ctxpp.toml`, builds the optional parser when needed, discovers the compilation database, and scans. It does not install packages or guess unknown build commands.
-2. Check `status`, then use `where`/`route`, `inspect`, `packet`, or an intent slice to narrow the relevant source. Retrieval refreshes only relevant stale translation units; an ordinary edit does not need a whole-repository rescan.
+1. Run `ctxpp --root ROOT init` only for an uninitialized workspace. For an already configured repository, start with the requested retrieval command; use `status` when you need to diagnose stale or unavailable state. Initialization preserves an existing `.ctxpp.toml`, builds the optional parser when needed, discovers the compilation database, and scans. It does not install packages or guess unknown build commands.
+2. Use `where`/`route`, `inspect`, `packet`, or an intent slice to narrow the relevant source. Retrieval refreshes only relevant stale translation units; an ordinary edit does not need a whole-repository rescan.
+   - For a test-focused request, use one `ctxpp inspect SYMBOL --intent test --budget 2400` call to see the target declaration, related data shapes, and bounded indexed test callsite/assertion windows. Excerpts are source-verified and may be partial; follow their path:line ranges when you need more. A compile-database build-target hint is only a mapping hint and does not run or report tests. Direct source reads and normal edits remain available.
+
 3. Read the canonical source range before editing. Test the change, then use status or targeted retrieval to confirm freshness. Explicit source-rewrite plans require current semantic evidence for affected files.
 
 Initialization is idempotent: never install packages or blindly configure an unknown project. In opted-in repositories, ordinary C++ work uses retrieval/authoring only. Never compact unrelated source; do not activate implicitly for routine C++ work in unconfigured repositories.

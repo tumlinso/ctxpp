@@ -11,6 +11,8 @@ Use intents to prioritize candidates:
 - `api`: public declaration/definition, invariants, compatibility tests.
 - `performance`: layouts, specialization, allocation, threading, launch/benchmark context.
 
+For a human test-focused lookup, `ctxpp inspect SYMBOL --intent test --budget 2400` presents the target declaration, related data shapes, and bounded indexed test callsite/assertion windows in one view. Source excerpts are freshness-checked and may be partial; follow the printed path:line ranges for omitted detail. Any compile-database build-target hint is not test execution or status. `packet` and `slice` retain their budgeted intent selection behavior.
+
 Inclusion classes are mandatory syntax, mandatory semantics, high-value behavior, validation, and optional neighborhood. Select complete semantic units best-first by utility per token; prerequisites may force small declarations. Never emit the full transitive closure automatically or truncate an entity.
 
 If mandatory material exceeds budget, emit whole highest-value mandatory units, mark `sufficient=0`, state mandatory tokens, and provide omission routes. Treat templates, inline/constexpr definitions, concepts, and required macros as body-required.

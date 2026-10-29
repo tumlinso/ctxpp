@@ -107,10 +107,14 @@ def parser() -> argparse.ArgumentParser:
         description = None
         help_text = None
         if name == "inspect":
-            help_text = "show a bounded, source-backed edit view for one symbol"
+            help_text = "show a bounded, source-backed view for one symbol"
             description = (
-                "Inspect one symbol with its canonical body, related type declarations, and nearby caller/test source. "
-                "For a focused edit, use: ctxpp inspect SYMBOL --intent edit --budget 2400. "
+                "Inspect one symbol with source-backed context. For edits, use: "
+                "ctxpp inspect SYMBOL --intent edit --budget 2400. "
+                "For tests, use: ctxpp inspect SYMBOL --intent test --budget 2400; this shows its "
+                "contract/declaration, related data shapes, bounded indexed test callsites, and a "
+                "build-target hint when the compilation database maps the test source. The hint does "
+                "not report test status. "
                 "Use where SYMBOL for a direct symbol location; use route WORDS for a natural-language query. "
                 "Intents apply to inspect, packet, and slice."
             )

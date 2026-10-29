@@ -28,6 +28,7 @@ ctxpp init
 ctxpp status
 ctxpp where 'Namespace::Type::method'
 ctxpp inspect 'Namespace::Type::method' --intent edit --budget 2400
+ctxpp inspect 'Namespace::Type::method' --intent test --budget 2400
 ```
 
 `init` creates `.ctxpp.toml` if it is absent, preserves existing settings,
@@ -39,6 +40,12 @@ instructions. The block is portable and may suggest installing the bundled
 For a first install of the skill in Codex, copy
 [`skills/cpp-context-compiler`](skills/cpp-context-compiler) into the Codex skills
 directory or use the skill installer with this repository path.
+
+For test work, `inspect --intent test` gives one bounded view of a target's
+declaration, related data shapes, and indexed test callsite/assertion windows.
+Those source excerpts are freshness-checked and may be partial; an optional
+build-target hint is derived from the compilation database and does not run a
+test.
 
 Ordinary retrieval refreshes only affected translation units. It reports
 staleness and missing build context rather than claiming complete semantic

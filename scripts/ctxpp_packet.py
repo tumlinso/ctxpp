@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 import shlex
 import sys
 import subprocess
 from pathlib import Path
+import sqlite3
+import tomllib
 from ctxpp_paths import state_dir
 from ctxpp_runtime import open_query_store
 from typing import Any
 
 from ctxpp_lib import (CtxppError, Tokenizer, load_index, partition_index,
-                       bounded_graph, recover_target_representation, sha256_bytes, sha256_file,
+                       _cpp_tokens, bounded_graph, recover_target_representation, sha256_bytes, sha256_file,
                        source_text, stable_json)
 
 
 CONTEXT_KEYS = ("types", "dependencies", "callers", "callees", "tests")
+DATA_SHAPE_KINDS = frozenset({
+    "StructDecl", "ClassDecl", "UnionDecl", "EnumDecl", "ClassTemplate",
+    "RecordDecl", "CXXRecordDecl",
+})
 
 
 def _git(root: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
@@ -583,7 +591,9 @@ def _target_block(root: Path, target: dict[str, Any], *, label: str = "target") 
     )
 
 
-def _related_range_block(root: Path, item: dict[str, Any], *, label: str) -> tuple[str | None, str | None]:
+def _related_range_block(root: Path, item: dict[str, Any], *, label: str,
+                         max_lines: int = RELATED_VIEW_MAX_LINES,
+                         max_bytes: int = RELATED_VIEW_MAX_BYTES) -> tuple[str | None, str | None]:
     """Render an indexed related symbol range after whole-file freshness validation."""
     location = item.get("location") or {}
     source = _verified_source(root, location)
@@ -601,11 +611,11 @@ def _related_range_block(root: Path, item: dict[str, Any], *, label: str) -> tup
     lines = body.splitlines()
     if not lines:
         return None, f"{label}: empty indexed source range"
-    shown_lines = lines[:RELATED_VIEW_MAX_LINES]
+    shown_lines = lines[:max_lines]
     shown = "\n".join(shown_lines)
     numbered, clipped = _numbered_source(shown, first_line, max_line_chars=320)
-    partial = len(lines) > len(shown_lines) or len(body.encode("utf-8")) > RELATED_VIEW_MAX_BYTES or clipped
-    if len(numbered.encode("utf-8")) > RELATED_VIEW_MAX_BYTES:
+    partial = len(lines) > len(shown_lines) or len(body.encode("utf-8")) > max_bytes or clipped
+    if len(numbered.encode("utf-8")) > max_bytes:
         return None, f"{label}: indexed source range is too large; open {location.get('path')}:{location.get('line')}"
     range_note = "partial indexed range" if partial else "indexed range verified"
     return (
@@ -613,6 +623,389 @@ def _related_range_block(root: Path, item: dict[str, Any], *, label: str) -> tup
         f"{numbered}",
         None,
     )
+
+
+def _test_graph(root: Path, target: dict[str, Any]):
+    """Return the bounded v2 incident graph with the same freshness checks as packet building."""
+    if not (state_dir(root) / "index.sqlite").is_file():
+        return None, "CTXPP-INDEX/2 unavailable; exact indexed callsite expansion skipped"
+    location = target.get("location") or {}
+    graph_target = {
+        "id": target.get("id"),
+        "name": target.get("name", ""),
+        "qualified_name": target.get("name", ""),
+        "kind": target.get("kind", ""),
+        "file": location.get("path", ""),
+        "start": location.get("byte_start", 0),
+        "end": location.get("byte_end", 0),
+    }
+    try:
+        meta, files, symbols, edges, truncated = bounded_graph(root, graph_target, limit=512)
+    except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+        return None, f"bounded indexed test context unavailable ({type(exc).__name__}); exact callsite expansion skipped"
+    indexed_files = {str(item.get("path", "")): item for item in files if item.get("path")}
+    context, stale_count, unknown_count = _collect_context(
+        root, graph_target, symbols, edges, indexed_files,
+        stale_files={str(path) for path in meta.get("_stale_relationship_files", [])},
+        stale_tus={str(tu) for tu in meta.get("_stale_relationship_tus", [])},
+        provenance_incomplete=bool(meta.get("_relationship_provenance_incomplete")),
+    )
+    return {
+        "meta": meta,
+        "files": indexed_files,
+        "symbols": {str(item.get("id", "")): item for item in symbols if item.get("id")},
+        "edges": edges,
+        "truncated": truncated,
+        "context": context,
+        "stale_count": stale_count,
+        "unknown_count": unknown_count,
+    }, None
+
+
+def _target_declaration_block(root: Path, target: dict[str, Any],
+                              indexed_symbol: dict[str, Any] | None) -> tuple[str | None, str | None]:
+    """Show an exact declaration range while omitting a function body for test intent."""
+    location = target.get("location") or {}
+    source = _verified_source(root, location)
+    if source is None:
+        return None, "target declaration: source file is missing or changed; excerpt withheld"
+    _, data = source
+    selected = _range_text(data, location)
+    if selected is None:
+        return None, "target declaration: indexed byte range is invalid; excerpt withheld"
+    body, first_line = selected
+    if sha256_bytes(body.encode("utf-8")) != target.get("text_sha256"):
+        return None, "target declaration: indexed range hash does not match; excerpt withheld"
+    start, end = int(location["byte_start"]), int(location["byte_end"])
+    kind = str(target.get("kind", ""))
+    is_definition = bool(target.get("definition", (indexed_symbol or {}).get("definition", False)))
+    is_data_shape = kind in DATA_SHAPE_KINDS
+    declaration_end: int | None = None
+    body_omitted = False
+    body_start = (indexed_symbol or {}).get("body_start")
+    try:
+        body_start_value = int(body_start) if body_start is not None else None
+    except (TypeError, ValueError):
+        body_start_value = None
+    if is_data_shape or not is_definition:
+        declaration_end = end
+    elif body_start_value is not None and start < body_start_value <= end:
+        declaration_end = body_start_value
+        body_omitted = True
+    else:
+        signature = str((indexed_symbol or {}).get("signature") or target.get("signature") or "")
+        signature_tokens = [token.text for token in _cpp_tokens(signature.encode("utf-8"))
+                           if token.kind not in ("comment", "preprocessor")]
+        source_tokens = [token for token in _cpp_tokens(data[start:end])
+                         if token.kind not in ("comment", "preprocessor")]
+        if signature_tokens and len(source_tokens) >= len(signature_tokens) and all(
+            token.text == expected for token, expected in zip(source_tokens, signature_tokens)
+        ):
+            following = source_tokens[len(signature_tokens):]
+            if not following or following[0].text in ("{", ";"):
+                declaration_end = start + source_tokens[len(signature_tokens) - 1].end
+                body_omitted = bool(following and following[0].text == "{")
+    if declaration_end is None or not start < declaration_end <= end:
+        return None, f"target declaration boundary unavailable; open {location.get('path')}:{location.get('line')}"
+    snippet = data[start:declaration_end].decode("utf-8", errors="replace").rstrip()
+    if not snippet:
+        return None, "target declaration is empty; excerpt withheld"
+    if len(snippet.encode("utf-8")) > 4096 or len(snippet.splitlines()) > 64:
+        return None, (f"target declaration is {len(snippet.splitlines())} lines / {len(snippet.encode('utf-8'))} bytes; "
+                      f"open {location.get('path')}:{location.get('line')}")
+    last_line = data[:declaration_end].count(b"\n") + 1
+    numbered, clipped = _numbered_source(snippet, first_line, max_line_chars=480)
+    note = "canonical source verified; body omitted" if body_omitted else "canonical source verified; complete declaration"
+    if is_data_shape:
+        note = "canonical source verified; complete data shape"
+    if clipped:
+        note += "; long line clipped"
+    return f"target declaration ({note}; {location['path']}:{first_line}-{last_line})\n{numbered}", None
+
+
+def _test_callsite_clusters(edges: list[dict[str, Any]], test_items: list[dict[str, Any]],
+                            meta: dict[str, Any], target_id: str) -> list[dict[str, Any]]:
+    by_test = {str(item.get("id", "")): item for item in test_items}
+    stale_files = set(str(path) for path in meta.get("_stale_relationship_files", []))
+    stale_tus = set(str(path) for path in meta.get("_stale_relationship_tus", []))
+    provenance_incomplete = bool(meta.get("_relationship_provenance_incomplete"))
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for edge in edges:
+        source_id = str(edge.get("from", ""))
+        path = str(edge.get("file", ""))
+        tu = str(edge.get("translation_unit", ""))
+        if (edge.get("type") != "test_relationship" or str(edge.get("to", "")) != target_id
+                or not source_id or source_id not in by_test or path in stale_files or tu in stale_tus
+                or (provenance_incomplete and not tu)):
+            continue
+        try:
+            start, end = int(edge["start"]), int(edge["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not path or start < 0 or end <= start:
+            continue
+        grouped.setdefault((path, source_id), []).append(edge)
+
+    clusters: list[dict[str, Any]] = []
+    for (path, source_id), source_edges in sorted(grouped.items()):
+        ordered = sorted(source_edges, key=lambda edge: (int(edge["start"]), -int(edge["end"])))
+        active: list[dict[str, Any]] = []
+        active_end = -1
+        for edge in ordered:
+            start, end = int(edge["start"]), int(edge["end"])
+            if active and start > active_end:
+                chosen = max(active, key=lambda item: int(item["end"]) - int(item["start"]))
+                clusters.append({"path": path, "source_id": source_id, "edge": chosen,
+                                 "item": by_test[source_id]})
+                active = []
+                active_end = -1
+            active.append(edge)
+            active_end = max(active_end, end)
+        if active:
+            chosen = max(active, key=lambda item: int(item["end"]) - int(item["start"]))
+            clusters.append({"path": path, "source_id": source_id, "edge": chosen,
+                             "item": by_test[source_id]})
+    deduplicated: dict[tuple[str, int, int], dict[str, Any]] = {}
+    for cluster in clusters:
+        edge = cluster["edge"]
+        identity = (cluster["path"], int(edge["start"]), int(edge["end"]))
+        deduplicated.setdefault(identity, cluster)
+    return sorted(deduplicated.values(), key=lambda item: (item["path"], int(item["edge"]["start"])))
+
+
+def _test_callsite_block(root: Path, cluster: dict[str, Any], indexed_files: dict[str, dict[str, Any]],
+                         relationship_status: str) -> tuple[str | None, str | None]:
+    edge, item = cluster["edge"], cluster["item"]
+    path = str(cluster["path"])
+    file_record = indexed_files.get(path, {})
+    location = {
+        "path": path,
+        "byte_start": int(edge["start"]),
+        "byte_end": int(edge["end"]),
+        "content_sha256": str(file_record.get("hash", "")),
+    }
+    source = _verified_source(root, location)
+    if source is None:
+        return None, f"test callsite: {path} source is missing or changed; excerpt withheld"
+    _, data = source
+    selected = _range_text(data, location)
+    if selected is None:
+        return None, f"test callsite: invalid indexed range; open {path}:{_line_for_offset(root / path, location['byte_start'])}"
+    _, first_line = selected
+    last_line = data[:location["byte_end"]].count(b"\n") + 1
+    all_lines = data.decode("utf-8", errors="replace").splitlines()
+    if not all_lines or not 1 <= first_line <= len(all_lines):
+        return None, f"test callsite: out-of-file indexed range; open {path}:{first_line}"
+    span_lines = max(1, last_line - first_line + 1)
+    max_window_lines = min(12, RELATED_VIEW_MAX_LINES)
+    if span_lines >= max_window_lines:
+        start_line, end_line = first_line, min(len(all_lines), first_line + max_window_lines - 1)
+    else:
+        context_room = max_window_lines - span_lines
+        before = min(2, context_room // 3)
+        after = min(4, context_room - before)
+        start_line = max(1, first_line - before)
+        end_line = min(len(all_lines), last_line + after)
+    numbered, clipped = _numbered_source(
+        "\n".join(all_lines[start_line - 1:end_line]), start_line,
+        highlight=(first_line, min(last_line, end_line)), max_line_chars=320,
+    )
+    if len(numbered.encode("utf-8")) > RELATED_VIEW_MAX_BYTES:
+        return None, f"test callsite window is too large; open {path}:{first_line}"
+    relation = ("semantic indexed callsite" if relationship_status == "semantic"
+                else "candidate callsite (relationship not verified)")
+    title = f"tests — {relation}; bounded local window: {item.get('name', item.get('id', 'test'))}"
+    note = f"source: {path}:{start_line}-{end_line}; indexed callsite: {first_line}-{last_line}"
+    if clipped:
+        note += "; long line clipped"
+    return f"{title}\n{note}\n{numbered}", None
+
+
+def _configured_test_build_hints(root: Path, test_paths: set[str]) -> list[str]:
+    if not test_paths:
+        return []
+    config_path = root / ".ctxpp.toml"
+    try:
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        configured = config.get("tool", {}).get("compilation_database", "compile_commands.json")
+        database = Path(str(configured))
+        if not database.is_absolute():
+            database = root / database
+        database = database.resolve(strict=True)
+        database.relative_to(root.resolve())
+        if not database.is_file() or database.stat().st_size > 8 * 1024 * 1024:
+            return []
+        entries = json.loads(database.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return []
+    build_dir = database.parent
+    try:
+        build_arg = build_dir.relative_to(root.resolve()).as_posix() or "."
+    except ValueError:
+        build_arg = build_dir.as_posix()
+    target_pattern = re.compile(r"(?:^|[/\\])CMakeFiles[/\\]([^/\\]+)\.dir(?:[/\\]|$)")
+    hints: list[str] = []
+    seen: set[str] = set()
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            source = Path(str(entry.get("file", "")))
+            if not source.is_absolute():
+                source = Path(str(entry.get("directory", root))) / source
+            relative_source = source.resolve().relative_to(root.resolve()).as_posix()
+        except (OSError, ValueError):
+            continue
+        if relative_source not in test_paths:
+            continue
+        outputs = [str(entry.get("output", ""))]
+        arguments = entry.get("arguments")
+        if isinstance(arguments, list):
+            command = [str(value) for value in arguments]
+        else:
+            try:
+                command = shlex.split(str(entry.get("command", "")))
+            except ValueError:
+                command = []
+        for index, argument in enumerate(command[:-1]):
+            if argument == "-o":
+                outputs.append(command[index + 1])
+        outputs.extend(argument[2:] for argument in command if argument.startswith("-o") and len(argument) > 2)
+        for output in outputs:
+            match = target_pattern.search(output)
+            if not match:
+                continue
+            target_name = match.group(1)
+            if target_name in seen:
+                continue
+            seen.add(target_name)
+            command_text = shlex.join(["cmake", "--build", build_arg, "--target", target_name])
+            hints.append(
+                f"build target hint from {relative_source}: {command_text} "
+                "(compile-database mapping only; build/test status unknown)"
+            )
+            if len(hints) >= 3:
+                return hints
+    return hints
+
+
+def _test_intent_blocks(root: Path, target: dict[str, Any], packet: dict[str, Any],
+                        relationship_trust: str) -> tuple[list[tuple[str, str]], list[str]]:
+    blocks: list[tuple[str, str]] = []
+    skipped: list[str] = []
+    graph, graph_error = _test_graph(root, target)
+    if graph is None:
+        skipped.append(graph_error or "bounded indexed test context unavailable")
+        context = packet.get("context", {})
+        groups = _contract_groups(packet.get("invariants", []))
+        locations = {str(target.get("location", {}).get("path", "")): target.get("location", {})}
+        for group in groups:
+            block, reason = _contract_block(root, group, locations)
+            if block:
+                blocks.append(("contract", block))
+            elif reason:
+                skipped.append(reason)
+        declaration, reason = _target_declaration_block(root, target, target)
+        if declaration:
+            blocks.append(("target declaration", declaration))
+        elif reason:
+            skipped.append(reason)
+        for item in context.get("types", [])[:4]:
+            block, reason = _related_range_block(
+                root, item, label=f"types: {item.get('name', item.get('id', 'item'))}",
+                max_lines=48, max_bytes=3072,
+            )
+            if block:
+                blocks.append(("type", block))
+            elif reason:
+                skipped.append(reason)
+        for item in context.get("tests", [])[:4]:
+            status = "semantic" if relationship_trust == "semantic" and item.get("semantic") else "candidate"
+            block, reason = _nearby_source_block(root, item, category="tests", relationship_status=status)
+            if block:
+                blocks.append(("test source", block))
+            elif reason:
+                skipped.append(reason)
+        skipped.append("fallback test windows are symbol-anchored, not exact indexed callsite ranges")
+        test_paths = {
+            str((item.get("location") or {}).get("path", ""))
+            for item in context.get("tests", [])
+            if (item.get("location") or {}).get("path")
+        }
+        for hint in _configured_test_build_hints(root, test_paths):
+            blocks.append(("build target hint", hint))
+        return blocks, skipped
+
+    meta = graph["meta"]
+    test_items = graph["context"]["tests"]
+    types = graph["context"]["types"]
+    target_symbol = graph["symbols"].get(str(target.get("id", "")))
+    declaration, reason = _target_declaration_block(root, target, target_symbol)
+    for group in _contract_groups(packet.get("invariants", [])):
+        location_map = {str(target.get("location", {}).get("path", "")): target.get("location", {})}
+        block, contract_error = _contract_block(root, group, location_map)
+        if block:
+            blocks.append(("contract", block))
+        elif contract_error:
+            skipped.append(contract_error)
+    if declaration:
+        blocks.append(("target declaration", declaration))
+    elif reason:
+        skipped.append(reason)
+
+    test_clusters = _test_callsite_clusters(
+        graph["edges"], test_items, meta, str(target.get("id", "")),
+    )
+    max_items = max(1, int(packet.get("request", {}).get("max_items", 12)))
+    all_test_cluster_count = len(test_clusters)
+    type_items = sorted(types, key=lambda item: (
+        0 if str(item.get("kind", "")) in DATA_SHAPE_KINDS - {"EnumDecl"} else 1,
+        str(item.get("name", "")), str(item.get("id", "")),
+    ))[:max_items]
+    test_clusters = test_clusters[:max_items]
+    selected: list[tuple[str, Any]] = []
+    type_index = test_index = 0
+    while len(selected) < max_items and (type_index < len(type_items) or test_index < len(test_clusters)):
+        if type_index < len(type_items):
+            selected.append(("type", type_items[type_index]))
+            type_index += 1
+        if len(selected) < max_items and test_index < len(test_clusters):
+            selected.append(("test", test_clusters[test_index]))
+            test_index += 1
+
+    chosen_test_paths: set[str] = set()
+    for category, item in selected:
+        if category == "type":
+            block, block_error = _related_range_block(
+                root, item, label=f"types: {item.get('name', item.get('id', 'item'))}",
+                max_lines=48, max_bytes=3072,
+            )
+            if block:
+                blocks.append((f"type:{item.get('id', item.get('name', 'type'))}", block))
+            elif block_error:
+                skipped.append(block_error)
+            continue
+        cluster = item
+        test_item = cluster["item"]
+        status = ("semantic" if relationship_trust == "semantic" and test_item.get("semantic")
+                  else "candidate")
+        block, block_error = _test_callsite_block(root, cluster, graph["files"], status)
+        if block:
+            blocks.append((f"test:{cluster['path']}:{cluster['edge']['start']}", block))
+            chosen_test_paths.add(str(cluster["path"]))
+        elif block_error:
+            skipped.append(block_error)
+    if len(types) > len(type_items):
+        skipped.append(f"additional indexed data shapes not shown: {len(types) - len(type_items)}")
+    if all_test_cluster_count > max_items:
+        skipped.append(f"additional indexed test callsites not shown: {all_test_cluster_count - max_items}")
+    if graph["truncated"]:
+        skipped.append("incident graph reached the 512-edge bound; some types or tests may be omitted")
+    if graph["stale_count"] or graph["unknown_count"]:
+        skipped.append("stale or provenance-incomplete indexed relationships were withheld")
+    for hint in _configured_test_build_hints(root, chosen_test_paths):
+        blocks.append(("build target hint", hint))
+    return blocks, skipped
 
 
 def _nearby_source_block(root: Path, item: dict[str, Any], *, category: str,
@@ -836,18 +1229,27 @@ def render_inspect(packet: dict[str, Any], tokenizer: Tokenizer | None = None) -
                         and sha256_bytes(selected[0].encode("utf-8")) == target.get("text_sha256"))
     relationship_trust = str(trust.get("relationships", "lexical-or-partial"))
     request = packet.get("request", {})
+    intent = str(request.get("intent", "edit"))
     budget = max(1, int(request.get("budget_tokens", 2400)))
     target_line = f"{target['name']} [{target['kind']}] — {location['path']}:{location['line']}-{location['end_line']}"
     header_lines = [target_line]
     if not current_hash:
         header_lines.append("source=canonical but stale or unverified; code excerpts withheld")
-    header_lines.append(
-        f"intent={request.get('intent', 'edit')} relationships={relationship_trust} "
-        f"budget={budget} tokens packet~={packet.get('estimated_tokens', 'unknown')} "
-        f"sufficient={int(bool(packet.get('coverage', {}).get('sufficient')))}"
-    )
+    if intent == "test":
+        machine_coverage = "complete" if packet.get("coverage", {}).get("sufficient") else "partial"
+        header_lines.append(
+            f"intent=test relationships={relationship_trust} budget={budget} "
+            f"tokens packet~={packet.get('estimated_tokens', 'unknown')} "
+            f"machine-packet-coverage={machine_coverage} test-view=bounded-indexed"
+        )
+    else:
+        header_lines.append(
+            f"intent={intent} relationships={relationship_trust} "
+            f"budget={budget} tokens packet~={packet.get('estimated_tokens', 'unknown')} "
+            f"sufficient={int(bool(packet.get('coverage', {}).get('sufficient')))}"
+        )
     omitted_counts = packet.get("coverage", {}).get("omitted", {})
-    if omitted_counts:
+    if omitted_counts and intent != "test":
         summary = ",".join(f"{key}={value}" for key, value in omitted_counts.items() if value)
         if summary:
             header_lines.append("indexed omissions: " + summary)
@@ -856,7 +1258,11 @@ def render_inspect(packet: dict[str, Any], tokenizer: Tokenizer | None = None) -
     if root is None:
         skipped.append("repository root unavailable")
     elif current_hash:
-        if not target.get("content") or not packet.get("coverage", {}).get("target_complete", True):
+        if intent == "test":
+            test_blocks, test_skipped = _test_intent_blocks(root, target, packet, relationship_trust)
+            blocks.extend(test_blocks)
+            skipped.extend(test_skipped)
+        elif not target.get("content") or not packet.get("coverage", {}).get("target_complete", True):
             skipped.append("target body was withheld by the packet budget; inspect is insufficient for a safe edit")
         else:
             block, reason = _target_block(root, target)
@@ -864,16 +1270,17 @@ def render_inspect(packet: dict[str, Any], tokenizer: Tokenizer | None = None) -
                 blocks.append(("target", block))
             elif reason:
                 skipped.append(reason)
-        context_blocks, context_skipped = _context_blocks(
-            root, target, packet.get("context", {}), packet.get("invariants", []),
-            str(request.get("intent", "edit")), relationship_trust,
-        )
-        blocks.extend(context_blocks)
-        skipped.extend(context_skipped)
+        if intent != "test":
+            context_blocks, context_skipped = _context_blocks(
+                root, target, packet.get("context", {}), packet.get("invariants", []),
+                intent, relationship_trust,
+            )
+            blocks.extend(context_blocks)
+            skipped.extend(context_skipped)
     else:
         skipped.append("rerun inspect so the current source range and relationships can be verified")
     route = _packet_route(packet, str(request.get("target", target["name"])),
-                          str(request.get("intent", "edit")))
+                          intent)
     return _bounded_human_view("\n".join(header_lines), blocks, budget=budget, tokenizer=tokenizer,
                                route=route, omitted=skipped)
 
